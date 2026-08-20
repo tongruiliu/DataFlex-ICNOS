@@ -88,6 +88,11 @@ class StaticReorder(Reorder):
     # Entry point B: permute dataset indices, stream in chunks
     # ------------------------------------------------------------------
 
+    def _on_candidate_pool_changed(self) -> None:
+        """Recompute the permutation over the new pool rather than reusing the old one."""
+        self._order = None
+        self._cursor = 0
+
     def _ensure_order(self, model=None, step_id: int = 0) -> List[int]:
         if self._order is not None:
             return self._order

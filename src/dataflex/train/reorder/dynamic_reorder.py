@@ -88,6 +88,17 @@ class DynamicReorder(Reorder):
             logger.info(f"[Dataflex][Reorder] score provider: {self._provider.describe()}")
         return self._provider
 
+    def _on_candidate_pool_changed(self) -> None:
+        """Adopt the new pool instead of finishing the old one.
+
+        Under composition an upstream stage re-derives the pool at every
+        boundary. Keeping the previous consume-once remainder would mean the
+        upstream stage's work (a selector's filter, a mixer's domain quota) never
+        reached the model after the first interval.
+        """
+        self._pool = None
+        self._pending = []
+
     def _ensure_pool(self) -> List[int]:
         if self._pool is None:
             pool = self.get_candidate_pool()

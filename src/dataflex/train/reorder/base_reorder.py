@@ -94,8 +94,21 @@ class Reorder(ABC):
         This is the seam for chaining after a selector: the selector decides
         *which* samples survive, this component then decides their order. When
         unset, it orders everything it is given.
+
+        Anything a subclass derived from the previous pool (a cached permutation,
+        a consume-once remainder) is invalidated, because otherwise an upstream
+        stage that re-filters every boundary would be silently ignored after the
+        first call.
         """
-        self._candidate_pool = list(indices) if indices is not None else None
+        new_pool = list(indices) if indices is not None else None
+        changed = new_pool != self._candidate_pool
+        self._candidate_pool = new_pool
+        if changed:
+            self._on_candidate_pool_changed()
+
+    def _on_candidate_pool_changed(self) -> None:
+        """Drop state derived from the old candidate pool. Overridden by subclasses."""
+        return None
 
     def get_candidate_pool(self) -> Optional[List[int]]:
         return list(self._candidate_pool) if self._candidate_pool is not None else None
