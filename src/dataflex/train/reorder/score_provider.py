@@ -15,7 +15,7 @@ comes from is a separate, swappable concern. Three sources are provided:
                    argument expressed with DataFlex's own artifacts.
 
 Note on polarity: these return raw scores. Interpreting whether high means good
-is `Reorderer.polarity`, not the provider's job.
+is `Reorder.polarity`, not the provider's job.
 """
 
 import json
@@ -158,7 +158,7 @@ class CachedSelectionScoreProvider(PrecomputedScoreProvider):
     """Reuse a score a selector already computed and cached.
 
     `save_selection` writes `{"indices": [...], "metric": {"loss": [...]}}`, so a
-    reorderer can consume a selector's work instead of paying for a second
+    reorder can consume a selector's work instead of paying for a second
     scoring pass. Positions absent from the cache get `fill_value`.
     """
 

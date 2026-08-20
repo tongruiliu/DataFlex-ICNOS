@@ -117,7 +117,7 @@ def get_dataset(
     sizes_str = {name: len(ds) for name, ds in per_source_pp.items()}
     logger.info_rank0(f"[Dataflex] Per-source preprocessed sizes: {sizes_str}")
 
-    # 打印初始比例配置
+    # Print initial proportion configuration
     logger.info_rank0(f"[Dataflex] sample_rule={data_args.mixture_sample_rule} | "
                         f"proportions={data_args.init_mixture_proportions} | "
                         f"seed={training_args.seed}")
@@ -152,9 +152,9 @@ def get_dataset(
             logger.info_rank0(f"[Dataflex] Mixer eval: '{eval_name}' -> domain '{domain}' ({len(eval_ds)} samples)")
         manager.mixer_eval_datasets = mixer_eval_by_domain
 
-    # 可选：把 manager 留给外部（方便在 callback 里重建）
-    # 例如附在 dataset_module 上（Trainer 不会用到这个字段）
-    dataset_module["train_dataset"] = None # 先占位，trainer里会rebuild
+    # Optional: expose manager to external code (for callback reconstruction)
+    # e.g. attached to dataset_module (Trainer doesn't use this field)
+    dataset_module["train_dataset"] = None # Placeholder, trainer will rebuild
     dataset_module["mixture_manager"] = manager
     logger.info_rank0("[Dataflex] Exposed mixture_manager for runtime re-mixing.")
 
@@ -211,13 +211,13 @@ def _concat_raw_scores(captured: List[Optional[np.ndarray]], score_field: str) -
     if not captured or any(part is None for part in captured):
         raise ValueError(
             f"[Dataflex][Reorder] score field '{score_field}' is missing from at least one dataset. "
-            f"Either add it to every source, or switch the reorderer to "
+            f"Either add it to every source, or switch the reorder to "
             f"`apply_at: index` with an explicit `score_path`."
         )
     return np.concatenate(captured, axis=0)
 
 
-def make_reorder_get_dataset(reorderer_factory):
+def make_reorder_get_dataset(reorder_factory):
     """Build a `get_dataset` that permutes raw rows before tokenization.
 
     Why here and not in the trainer: the score lives in the raw JSONL and is
@@ -228,7 +228,7 @@ def make_reorder_get_dataset(reorderer_factory):
     relative position.
 
     Args:
-        reorderer_factory: zero-arg callable returning a reorderer exposing
+        reorder_factory: zero-arg callable returning a reorder exposing
             `order_rows(scores) -> permutation` and a `score_params` dict.
     """
 
@@ -255,8 +255,8 @@ def make_reorder_get_dataset(reorderer_factory):
         if data_args.streaming:
             raise ValueError("[Dataflex][Reorder] reordering requires `streaming: false`.")
 
-        reorderer = reorderer_factory()
-        score_field = reorderer.score_params.get("score_field", "score")
+        reorder = reorder_factory()
+        score_field = reorder.score_params.get("score_field", "score")
 
         with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
             with _capture_raw_scores(score_field) as captured:
@@ -272,7 +272,7 @@ def make_reorder_get_dataset(reorderer_factory):
             )
 
             if dataset is not None:
-                score_path = reorderer.score_params.get("score_path")
+                score_path = reorder.score_params.get("score_path")
                 if score_path:
                     from ..reorder.score_provider import PrecomputedScoreProvider
 
@@ -292,10 +292,10 @@ def make_reorder_get_dataset(reorderer_factory):
                         f"carries '{score_field}'."
                     )
 
-                permutation = reorderer.order_rows(scores)
+                permutation = reorder.order_rows(scores)
                 dataset = dataset.select(permutation)
                 logger.info_rank0(
-                    f"[Dataflex][Reorder] applied '{reorderer.pattern}' to {len(permutation)} raw rows "
+                    f"[Dataflex][Reorder] applied '{reorder.pattern}' to {len(permutation)} raw rows "
                     f"before preprocessing."
                 )
 

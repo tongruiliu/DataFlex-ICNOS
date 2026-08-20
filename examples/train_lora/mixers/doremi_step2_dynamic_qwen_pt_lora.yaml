@@ -57,8 +57,8 @@ ddp_timeout: 180000000
 train_type: dynamic_mix
 components_cfg_file: src/dataflex/configs/components.yaml
 component_name: doremi
-mixture_sample_rule: mixture # 初始采样规则，mixture为根据init_mixture_proportions比例混合（可动态调整），stratified为固定按源数据集大小比例分层，uniform为固定均匀分布
-init_mixture_proportions: [0.5, 0.5] # 对应初始的比例，可通过额外算法自行调整
+mixture_sample_rule: mixture # initial sampling rule, mixture is according to the init_mixture_proportions ratio (can be dynamically adjusted), stratified is fixed according to the source dataset size ratio, uniform is fixed uniform distribution
+init_mixture_proportions: [0.5, 0.5] # corresponding initial proportions, can be adjusted by additional algorithms
 warmup_step: 100
 update_step: 200
 update_times: 3

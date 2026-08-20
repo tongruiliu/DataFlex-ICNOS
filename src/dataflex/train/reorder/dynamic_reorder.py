@@ -3,15 +3,15 @@ from typing import List, Optional, Sequence
 import numpy as np
 import torch.distributed as dist
 
-from dataflex.core.registry import register_reorderer
+from dataflex.core.registry import register_reorder
 from dataflex.utils.logging import logger
 
-from .base_reorderer import Reorderer
+from .base_reorder import Reorder
 from .score_provider import build_score_provider
 
 
-@register_reorderer("dynamic")
-class DynamicReorderer(Reorderer):
+@register_reorder("dynamic")
+class DynamicReorder(Reorder):
     """Re-score and re-order the remaining pool as training progresses.
 
     The static path fixes the whole curriculum before the first step, so the
@@ -71,7 +71,7 @@ class DynamicReorderer(Reorderer):
         self._call_count = 0
 
         logger.info(
-            f"[Dataflex][Reorder] DynamicReorderer({self.describe()}, score_source={score_source}, "
+            f"[Dataflex][Reorder] DynamicReorder({self.describe()}, score_source={score_source}, "
             f"reorder_every={self.reorder_every}, consume_once={self.consume_once})"
         )
 
@@ -93,7 +93,7 @@ class DynamicReorderer(Reorderer):
             pool = self.get_candidate_pool()
             if pool is None:
                 if self.dataset is None:
-                    raise ValueError("DynamicReorderer needs a dataset or an explicit candidate pool")
+                    raise ValueError("DynamicReorder needs a dataset or an explicit candidate pool")
                 pool = list(range(len(self.dataset)))
             self._pool = list(pool)
         return self._pool

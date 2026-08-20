@@ -1,12 +1,12 @@
 """Data ordering components.
 
-Importing this package is what registers the reorderers, so every reorderer must
+Importing this package is what registers the reorders, so every reorder must
 be imported here. Registry names must be unique or `REGISTRY.register` raises at
 import time.
 """
 
-from .base_reorderer import POLARITIES, Reorderer
-from .dynamic_reorderer import DynamicReorderer
+from .base_reorder import POLARITIES, Reorder
+from .dynamic_reorder import DynamicReorder
 from .patterns import PATTERNS, apply_pattern
 from .score_provider import (
     CachedSelectionScoreProvider,
@@ -15,17 +15,17 @@ from .score_provider import (
     ScoreProvider,
     build_score_provider,
 )
-from .static_reorderer import StaticReorderer
+from .static_reorder import StaticReorder
 
-#: Registered reorderer classes. Unlike the other families, a reorderer preset in
+#: Registered reorder classes. Unlike the other families, a reorder preset in
 #: components.yaml is named after the *ordering* it produces (`saw`, `folding`,
 #: ...) rather than after its class, because the ordering is chosen by config.
 #: `kind` is what maps a preset onto one of these.
 KINDS = ("static", "dynamic")
 
 
-def resolve_reorderer_kind(component_name: str, params: dict) -> str:
-    """Decide which reorderer class a components.yaml preset refers to.
+def resolve_reorder_kind(component_name: str, params: dict) -> str:
+    """Decide which reorder class a components.yaml preset refers to.
 
     Falls back to the preset name so a preset named directly after a class still
     works without a `kind`, matching how selectors/mixers/weighters behave.
@@ -33,7 +33,7 @@ def resolve_reorderer_kind(component_name: str, params: dict) -> str:
     kind = params.pop("kind", None) or component_name
     if kind not in KINDS:
         raise ValueError(
-            f"reorderer preset '{component_name}' resolves to kind '{kind}', which is not registered. "
+            f"reorder preset '{component_name}' resolves to kind '{kind}', which is not registered. "
             f"Set `kind` to one of {list(KINDS)} in its params block."
         )
     return kind
@@ -43,14 +43,14 @@ __all__ = [
     "POLARITIES",
     "PATTERNS",
     "KINDS",
-    "Reorderer",
-    "StaticReorderer",
-    "DynamicReorderer",
+    "Reorder",
+    "StaticReorder",
+    "DynamicReorder",
     "ScoreProvider",
     "PrecomputedScoreProvider",
     "CachedSelectionScoreProvider",
     "ModelLossScoreProvider",
     "build_score_provider",
     "apply_pattern",
-    "resolve_reorderer_kind",
+    "resolve_reorder_kind",
 ]

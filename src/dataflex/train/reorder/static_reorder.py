@@ -1,14 +1,14 @@
 from typing import List, Optional, Sequence
 
-from dataflex.core.registry import register_reorderer
+from dataflex.core.registry import register_reorder
 from dataflex.utils.logging import logger
 
-from .base_reorderer import Reorderer
+from .base_reorder import Reorder
 from .score_provider import build_score_provider
 
 
-@register_reorderer("static")
-class StaticReorderer(Reorderer):
+@register_reorder("static")
+class StaticReorder(Reorder):
     """Order the dataset once, from scores that do not depend on the model.
 
     This is the faithful reproduction of the paper: a single global permutation
@@ -68,7 +68,7 @@ class StaticReorderer(Reorderer):
         self._cursor = 0
 
         logger.info(
-            f"[Dataflex][Reorder] StaticReorderer({self.describe()}, "
+            f"[Dataflex][Reorder] StaticReorder({self.describe()}, "
             f"score_source={score_source}, apply_at={apply_at})"
         )
 
@@ -95,7 +95,7 @@ class StaticReorderer(Reorderer):
         pool = self.get_candidate_pool()
         if pool is None:
             if self.dataset is None:
-                raise ValueError("StaticReorderer needs a dataset or an explicit candidate pool")
+                raise ValueError("StaticReorder needs a dataset or an explicit candidate pool")
             pool = list(range(len(self.dataset)))
 
         if self.apply_at == "raw":
@@ -119,7 +119,7 @@ class StaticReorderer(Reorderer):
         if provider.is_dynamic:
             logger.warning(
                 f"[Dataflex][Reorder] score source '{self.score_source}' depends on the model but "
-                f"StaticReorderer scores only once, at the first update. Use the 'dynamic' reorderer "
+                f"StaticReorder scores only once, at the first update. Use the 'dynamic' reorder "
                 f"to re-score as training progresses."
             )
 

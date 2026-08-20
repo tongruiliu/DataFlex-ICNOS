@@ -29,10 +29,10 @@ _POLARITY_ALIASES = {
 }
 
 
-class Reorderer(ABC):
+class Reorder(ABC):
     """Base class for data ordering components.
 
-    A reorderer turns a set of *positions* plus their scores into a permutation.
+    A reorder turns a set of *positions* plus their scores into a permutation.
     Positions are opaque integers whose meaning depends on the path: raw dataset
     rows for the static path, indices into the preprocessed ``train_dataset`` for
     the dynamic path.
@@ -84,7 +84,7 @@ class Reorderer(ABC):
     #
     # These exist so reorder can later be chained with select/mix/weight into a
     # single data pipeline without reworking the component. They are all no-ops
-    # by default, so a standalone reorderer behaves exactly as if they were
+    # by default, so a standalone reorder behaves exactly as if they were
     # absent.
     # ------------------------------------------------------------------
 
@@ -92,8 +92,8 @@ class Reorderer(ABC):
         """Restrict ordering to a subset of positions.
 
         This is the seam for chaining after a selector: the selector decides
-        *which* samples survive, the reorderer then decides their order. When
-        unset, the reorderer orders everything it is given.
+        *which* samples survive, this component then decides their order. When
+        unset, it orders everything it is given.
         """
         self._candidate_pool = list(indices) if indices is not None else None
 

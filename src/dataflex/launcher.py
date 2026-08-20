@@ -72,23 +72,23 @@ def patch_trainer(train_type: str):
         TrainerCls = None
 
     if TrainerCls is not None:
-        # 1) 替换源头模块
+        # 1) Replace source module
         tmod = importlib.import_module("llamafactory.train.sft.trainer")
         tmod.CustomSeq2SeqTrainer = TrainerCls
 
-        # 2) 替换包层 re-export
+        # 2) Replace package layer re-export
         sft_pkg = importlib.import_module("llamafactory.train.sft")
         setattr(sft_pkg, "CustomSeq2SeqTrainer", TrainerCls)
 
-        # 3) 替换 workflow 内部引用
+        # 3) Replace workflow internal references
         wflow = importlib.import_module("llamafactory.train.sft.workflow")
         setattr(wflow, "CustomSeq2SeqTrainer", TrainerCls)
         
-        # 4) 替换 PT 训练器
+        # 4) Replace PT trainer
         pt_tmod = importlib.import_module("llamafactory.train.pt.trainer")
         pt_tmod.CustomTrainer = TrainerCls
         
-        # 5) 替换 PT workflow 内部引用
+        # 5) Replace PT workflow internal references
         pt_wflow = importlib.import_module("llamafactory.train.pt.workflow")
         setattr(pt_wflow, "CustomTrainer", TrainerCls)
 
@@ -96,42 +96,42 @@ def patch_trainer(train_type: str):
 
 def patch_get_dataset(do_uncache_reload: bool = False):
     """
-    将 LlamaFactory 的 get_dataset 替换为 dataflex 版本。
-    - 源头: llamafactory.data.loader.get_dataset -> dataflex.train.data.loader.get_dataset
-    - 包层 re-export: 覆盖 llamafactory.data.get_dataset（如有）
-    - 就地覆盖: 对已 from-import 的使用方（包含 workflow）直接改其全局符号
+    Replace LlamaFactory's get_dataset with dataflex version.
+    - Source: llamafactory.data.loader.get_dataset -> dataflex.train.data.loader.get_dataset
+    - Package layer re-export: Overwrite llamafactory.data.get_dataset (if any)
+    - In-place overwrite: Directly modify the global symbol for already from-imported users (including workflow)
 
     Args:
-        do_uncache_reload: 为 True 时，会清理下游依赖缓存并预热导入，以确保后续 import 也拿到新函数。
-                          默认为 False（与“就地打补丁”策略一致）。
+        do_uncache_reload: When True, will clear downstream dependency cache and warm up imports to ensure subsequent imports also get the new function.
+                           Default is False (consistent with "in-place patching" strategy).
     """
-    # 1) 引入新实现
+    # 1) Introduce new implementation
     from dataflex.train.data.loader import get_dataset as _new_get_dataset
-    # 2) 覆盖源头模块
+    # 2) Overwrite source module
     data_loader_mod = importlib.import_module("llamafactory.data.loader")
     setattr(data_loader_mod, "get_dataset", _new_get_dataset)
-    # 3) 覆盖包层 re-export（若其它代码从包层 import）
+    # 3) Overwrite package layer re-export (if other code imports from package layer)
     data_pkg = importlib.import_module("llamafactory.data")
     setattr(data_pkg, "get_dataset", _new_get_dataset)
-    # 4) 就地覆盖已 from-import 的使用方（包含 workflow）
+    # 4) In-place overwrite already from-imported users (including workflow)
     wflow = importlib.import_module("llamafactory.train.sft.workflow")
     setattr(wflow, "get_dataset", _new_get_dataset)
     
-    # 5) 也要patch PT workflow
+    # 5) Also patch PT workflow
     pt_wflow = importlib.import_module("llamafactory.train.pt.workflow")
     setattr(pt_wflow, "get_dataset", _new_get_dataset)
 
 def patch_reorder_get_dataset(cfg):
     """
-    将 get_dataset 替换为"先按分数重排原始行、再做预处理"的版本。
+    Replace get_dataset with the version that "first reorder raw rows by score, then preprocess".
 
-    只有 apply_at == 'raw' 时才需要：分数字段在 align_dataset 里就被删掉了，
-    而预处理不保 index（脏样本会被丢弃、packing 会合并行），所以直接重排原始
-    数据集，让顺序自然传递下去。apply_at == 'index' 时顺序在 trainer 里施加，
-    数据加载流程无需改动。
+    Only needed when apply_at == 'raw': the score field is removed in align_dataset,
+    and preprocessing does not preserve index (dirty samples are discarded, packing merges rows),
+    so we directly reorder the raw dataset to pass the order naturally.
+    When apply_at == 'index', the order is applied in trainer, and the data loading process remains unchanged.
 
     Returns:
-        bool: 是否真的打了补丁。
+        bool: Whether the patch is actually applied.
     """
     from dataflex.utils.load_component import load_component
 
@@ -142,24 +142,24 @@ def patch_reorder_get_dataset(cfg):
 
     from dataflex.core.registry import REGISTRY
     from dataflex.train.data.loader import make_reorder_get_dataset
-    from dataflex.train.reorder import resolve_reorderer_kind  # also registers the reorderers
+    from dataflex.train.reorder import resolve_reorder_kind  # also registers the reorders
 
-    params = load_component('reorderers', cfg_file, name, runtime_vars={})
-    kind = resolve_reorderer_kind(name, params)
+    params = load_component('reorders', cfg_file, name, runtime_vars={})
+    kind = resolve_reorder_kind(name, params)
 
-    # 只有"静态 + 在原始行上重排"才需要改数据加载。动态排序的分数来自当前模型，
-    # 顺序必然是在 trainer 里按 dataset index 施加的。
+    # Only "static + reorder on raw rows" needs to modify data loading. The dynamic sorting scores come from the current model,
+    # the order must be applied in trainer by dataset index.
     if kind != 'static' or params.get('apply_at', 'raw') != 'raw':
-        print(f"[PatchReorder] reorderer '{name}' orders by dataset index; dataset loading left untouched.")
+        print(f"[PatchReorder] reorder '{name}' orders by dataset index; dataset loading left untouched.")
         return False
 
-    def reorderer_factory():
-        return REGISTRY.build('reorderer', kind, runtime={}, cfg=params)
+    def reorder_factory():
+        return REGISTRY.build('reorder', kind, runtime={}, cfg=params)
 
-    _new_get_dataset = make_reorder_get_dataset(reorderer_factory)
+    _new_get_dataset = make_reorder_get_dataset(reorder_factory)
 
-    # 与 patch_get_dataset 同样的四处覆盖：源头模块、包层 re-export、以及
-    # sft/pt 两个 workflow 里已经 from-import 过的全局符号。
+    # Same four patches as patch_get_dataset: source module, package layer re-export, and
+    # already from-imported global symbols in sft/pt workflows.
     data_loader_mod = importlib.import_module("llamafactory.data.loader")
     setattr(data_loader_mod, "get_dataset", _new_get_dataset)
     data_pkg = importlib.import_module("llamafactory.data")
@@ -169,7 +169,7 @@ def patch_reorder_get_dataset(cfg):
     pt_wflow = importlib.import_module("llamafactory.train.pt.workflow")
     setattr(pt_wflow, "get_dataset", _new_get_dataset)
 
-    print(f"[PatchReorder] reorderer '{name}' will permute raw rows before preprocessing.")
+    print(f"[PatchReorder] reorder '{name}' will permute raw rows before preprocessing.")
     return True
 
 
@@ -181,7 +181,7 @@ def read_args():
         dict_config = OmegaConf.load(Path(file_path).absolute())
         cfg = OmegaConf.merge(dict_config, override_config)
     else:
-        cfg = OmegaConf.create({})  # CLI 直接传参时
+        cfg = OmegaConf.create({})  # When passing CLI arguments directly
     
     return OmegaConf.to_container(cfg)
 

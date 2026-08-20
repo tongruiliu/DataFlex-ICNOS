@@ -56,8 +56,8 @@ ddp_timeout: 180000000
 ### dynamic_train - ODM: Online Data Mixing with Multi-Armed Bandits
 train_type: dynamic_mix
 components_cfg_file: src/dataflex/configs/components.yaml
-component_name: odm  # 使用ODM混合器 (Online Data Mixing with Exp3)
-mixture_sample_rule: mixture # 初始采样规则，mixture为根据init_mixture_proportions比例混合
+component_name: odm  # use ODM mixer (Online Data Mixing with Exp3)
+mixture_sample_rule: mixture # initial sampling rule, mixture is according to the init_mixture_proportions ratio
 init_mixture_proportions: [0.5, 0.5] # initial weights
 warmup_step: 10
 update_step: 10

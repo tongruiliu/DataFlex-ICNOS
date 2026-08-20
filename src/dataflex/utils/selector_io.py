@@ -29,8 +29,8 @@ def save_selection(
     accelerator,
 ) -> None:
     """
-    以统一格式保存，并仅由主进程落盘。
-    存储为标准的 JSON 格式。
+    Save in a unified format and only by the main process.
+    Stored as standard JSON format.
     """
     if accelerator.is_main_process:
         _ensure_parent_dir(save_path)
@@ -39,5 +39,5 @@ def save_selection(
             "metric": metric,
         }
         with open(save_path, "w") as f:
-            json.dump(payload, f, indent=4)  # 保存为漂亮的JSON格式
+            json.dump(payload, f, indent=4)  # Save in a pretty JSON format
         logger.info(f"[Dataflex] Saved selection to {save_path}.")

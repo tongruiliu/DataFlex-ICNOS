@@ -170,26 +170,26 @@ weighters:
   adapt:
     name: adapt
     params:
-      tau: 1.0              # 温度，越小权重区分越锐利
-      refresh_interval: 50  # 每多少步用当前模型刷新一次 anchor 向量
-      anchor_batch_size: 8  # 计算句向量时的前向 batch 大小
-      clip: null            # 可选权重上限，防梯度爆炸
+      tau: 1.0              # Temperature, smaller values make weight distinction sharper
+      refresh_interval: 50  # Every how many steps to refresh the anchor vector with the current model
+      anchor_batch_size: 8  # Forward batch size for computing sentence embeddings
+      clip: null            # Optional weight upper bound, to prevent gradient explosion
 
   joint_update_aware:
     name: joint_update_aware
     params:
-      # 求解 max_w  s^T w - (beta / 2) w^T S w + tau * H(w)
-      # S 为归一化 embedding 的余弦 Gram 矩阵，s_i = <u, z_i> 为对 anchor 均值 u 的对齐度
-      beta: 0.1               # 交互/冗余强度
-      tau: 0.05               # 熵温度（需 > 0），越小权重越锐利
-      fixed_point_iters: 5    # 阻尼定点迭代次数
-      damping: 1.0            # 阻尼系数 rho ∈ (0, 1]，1.0 表示不阻尼
-      target_update_step: 50  # 每多少步用 eval 集刷新一次目标向量
-      target_batch_size: 1    # 计算目标向量时的前向 batch 大小
-      target_num_batches: 1   # 每次刷新平均多少个 eval batch；设为 0 表示遍历整个 eval 集
-      embed_normalize: true   # 是否对 embedding 做 L2 归一化
-      pooling: last_token     # 句向量池化方式：last_token / mean_pool
-      embed_layer: -1         # 取哪一层 hidden state，-1 为最后一层
+      # Solve max_w  s^T w - (beta / 2) w^T S w + tau * H(w)
+      # S is the cosine Gram matrix of normalized embeddings, s_i = <u, z_i> is the alignment degree of the anchor mean u
+      beta: 0.1               # Interaction/redundancy strength
+      tau: 0.05               # Entropy temperature (must be > 0), smaller values make weights sharper
+      fixed_point_iters: 5    # Damping fixed point iterations
+      damping: 1.0            # Damping coefficient rho ∈ (0, 1], 1.0 means no damping
+      target_update_step: 50  # Every how many steps to refresh the target vector with the eval set
+      target_batch_size: 1    # Forward batch size for computing target embeddings
+      target_num_batches: 1   # Average how many eval batches to refresh per target; set to 0 to iterate through the entire eval set
+      embed_normalize: true   # Whether to normalize embeddings with L2 norm
+      pooling: last_token     # Sentence vector pooling: last_token / mean_pool
+      embed_layer: -1         # Which hidden state layer to take, -1 means the last layer
       objective_mode: full    # full / align_only / diverse_only / uniform
 
   custom:
@@ -197,10 +197,10 @@ weighters:
     params:
       strategy: uniform
 
-reorderers:
-  # Data reorderers change sample order only; the number of samples is untouched.
+reorders:
+  # Data reorders change sample order only; the number of samples is untouched.
   #
-  # Every reorderer is defined along three axes:
+  # Every reorder is defined along three axes:
   #   pattern       : one of seven orderings, covering the four guidances of the paper
   #                   [shuffle, sorting, folding, zigzag, segment, stair, saw]
   #   score_source  : where the scores come from [precomputed, cached_selection, model_loss]

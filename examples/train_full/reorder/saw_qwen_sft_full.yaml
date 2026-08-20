@@ -1,0 +1,62 @@
+### model
+model_name_or_path: Qwen/Qwen3-1.7B-Base
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z2_config.json
+
+### dataset
+# Original jsonl must contain a score field (see score_field in components.yaml).
+# The paper uses "quality scores" like FineWeb-Edu's education score / QuRating score.
+dataset: alpaca_en_demo
+template: qwen
+cutoff_len: 2048
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+seed: 42
+
+# Constraints related to order:
+#   - val_size must be 0 (train_test_split will shuffle, shuffle the order); use eval_dataset for validation
+#   - mix_strategy must be concat (interleave_* will shuffle); use eval_dataset for validation
+#   - num_samples in dataset_info.json must not be set (it uses an unseeded random permutation)
+val_size: 0
+mix_strategy: concat
+
+# packing will re-pack samples within a window of preprocessing_batch_size, which is equivalent to an implicit JIT of that width.
+# To make a clean comparison, turn it off.
+packing: false
+
+# It is recommended to use a separate tokenized_path for each reorder variant to avoid mixing up HF cache and avoid duplicate tokenization.
+# tokenized_path: ../dataflex_saves/tokenized/alpaca_saw
+
+### output
+output_dir: ../dataflex_saves/Qwen3-1.7B/reorder_saw
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+report_to: none
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+
+### Dataflex args
+train_type: dynamic_reorder
+components_cfg_file: src/dataflex/configs/components.yaml
+component_name: saw          # preset name in reorders in components.yaml
+                             # optional: sorting(CL) / shuffle / segment / folding / zigzag / stair / saw
+warmup_step: 10
+update_step: 50
+update_times: 20             # to run a full round, let warmup_step + update_step*update_times
+                             # approximately equal to len(dataset) / (per_device_bs * grad_accum * world_size)

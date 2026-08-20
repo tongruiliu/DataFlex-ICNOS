@@ -9,7 +9,7 @@ finetuning_type: full
 deepspeed: examples/deepspeed/ds_z2_config.json
 
 ### dataset
-# 动态排序不需要原始数据带分数字段：分数由当前模型在线算出来。
+# Dynamic reorder does not require original data to have a score field: the score is calculated online by the current model.
 dataset: alpaca_en_demo
 template: qwen
 cutoff_len: 2048
@@ -43,8 +43,8 @@ train_type: dynamic_reorder
 components_cfg_file: src/dataflex/configs/components.yaml
 component_name: dynamic_saw
 warmup_step: 10
-update_step: 50              # 每 50 步用当前模型重新给剩余样本打分并重排
+update_step: 50              # every 50 steps, use the current model to re-score and re-order the remaining samples
 update_times: 20
 
-# 开销提醒：每个 update 间隔要对样本池做一次前向。用 components.yaml 里的
-# score_params.max_samples 限制打分规模，或调大 reorder_every 降低打分频率。
+# Cost reminder: every update interval, the sample pool needs to do one forward pass. Use score_params.max_samples in components.yaml to limit the scoring scale, or increase reorder_every to reduce the scoring frequency.
+# Use score_params.max_samples in components.yaml to limit the scoring scale, or increase reorder_every to reduce the scoring frequency.

@@ -20,14 +20,14 @@ class Registry:
     def build(self, kind: str, name: str, *, runtime: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None):
         cls = self.get(kind, name)
         cfg = cfg or {}
-        merged = {**cfg, **runtime}                     # 运行期依赖优先
+        merged = {**cfg, **runtime}                     # Runtime dependencies take precedence
         sig = inspect.signature(cls.__init__)
-        accepted = {p.name for p in list(sig.parameters.values())[1:]}  # 跳过 self
-        filtered = {k: v for k, v in merged.items() if k in accepted}   # 只喂需要的
+        accepted = {p.name for p in list(sig.parameters.values())[1:]}  # Skip self
+        filtered = {k: v for k, v in merged.items() if k in accepted}   # Only feed needed
         return cls(**filtered)
 
 REGISTRY = Registry()
 def register_selector(name: str): return REGISTRY.register("selector", name)
 def register_mixer(name: str):    return REGISTRY.register("mixer", name)
 def register_weighter(name: str):    return REGISTRY.register("weighter", name)
-def register_reorderer(name: str):   return REGISTRY.register("reorderer", name)
+def register_reorder(name: str):   return REGISTRY.register("reorder", name)
