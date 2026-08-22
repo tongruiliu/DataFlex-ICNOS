@@ -52,7 +52,7 @@ def patch_trainer(train_type: str):
         train_type (str): Must be one of ["static", "dynamic_select", "dynamic_mix", "dynamic_weight"].
                           Determines which trainer class to inject.
     """
-    valid_types = ["static", "dynamic_select", "dynamic_mix", "dynamic_weight", "dynamic_reorder"]
+    valid_types = ["static", "dynamic_select", "dynamic_mix", "dynamic_weight", "dynamic_reorder", "dynamic_lego"]
     if train_type not in valid_types:
         raise ValueError(f"Invalid train_type '{train_type}'. Must be one of {valid_types}.")
 
@@ -68,6 +68,9 @@ def patch_trainer(train_type: str):
     elif train_type == "dynamic_reorder":
         from dataflex.train.trainer.reorder_trainer import ReorderTrainer
         TrainerCls = ReorderTrainer
+    elif train_type == "dynamic_lego":
+        from dataflex.train.trainer.lego_trainer import LegoTrainer
+        TrainerCls = LegoTrainer
     else:  # static
         TrainerCls = None
 
@@ -173,6 +176,29 @@ def patch_reorder_get_dataset(cfg):
     return True
 
 
+def patch_lego_get_dataset():
+    """
+    Replace get_dataset with the version for combined training.
+
+    The key difference from dynamic_mix: dynamic_mix makes each data source an independent dataset and sets train_dataset to None, so selector/reorder have no indexed datasets.
+    The combined path goes the other way around: combine into a dataset, then give an array of domain_id labels for each sample, so the mixer becomes pure index operations, and the other three families work as usual.
+    """
+    from dataflex.train.data.loader import lego_get_dataset as _new_get_dataset
+
+    # Same four patches as patch_get_dataset: source module, package layer re-export, and
+    # already from-imported global symbols in sft/pt workflows.
+    data_loader_mod = importlib.import_module("llamafactory.data.loader")
+    setattr(data_loader_mod, "get_dataset", _new_get_dataset)
+    data_pkg = importlib.import_module("llamafactory.data")
+    setattr(data_pkg, "get_dataset", _new_get_dataset)
+    wflow = importlib.import_module("llamafactory.train.sft.workflow")
+    setattr(wflow, "get_dataset", _new_get_dataset)
+    pt_wflow = importlib.import_module("llamafactory.train.pt.workflow")
+    setattr(pt_wflow, "get_dataset", _new_get_dataset)
+
+    print("[PatchLego] dataset will carry a per-sample domain_id for the pipeline.")
+
+
 def read_args():
     file_path = sys.argv[1]
     override_config = OmegaConf.from_cli(sys.argv[2:])
@@ -196,6 +222,8 @@ def launch():
         patch_get_dataset()
     elif train_type == 'dynamic_reorder':
         patch_reorder_get_dataset(cfg)
+    elif train_type == 'dynamic_lego':
+        patch_lego_get_dataset()
     patch_train_from_scratch_pad()
 
     from llamafactory.train.tuner import run_exp

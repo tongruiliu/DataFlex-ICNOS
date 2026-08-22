@@ -402,3 +402,99 @@ reorders:
       score_params:
         cache_path: ../dataflex_saves/loss_output/step_10.json
         metric_key: loss
+
+pipelines:
+  # lego-like composable data scheduling (train_type: dynamic_lego).
+  #
+  # A pipeline is a chain of stages, each stage only says two things: which family to use and which preset under that family. So every preset in selectors/mixers/reorders/weighters can be used directly as a building block, without writing a new component for combinations.
+  #
+  # stage fields:
+  #   family      : selector | mixer | reorder | weighter
+  #   component   : preset name under the family bucket
+  #   warmup_step : when the stage starts to take effect (before it is passed through)
+  #   every       : how many optimizer steps to recalculate
+  #   enabled     : false skips a stage, i.e. "leave that brick out"
+  #
+  # Two hard rules (pipeline checks them, not relying on YAML):
+  #   1. The order of index space is semantically fixed as select -> mix -> reorder.
+  #      Writing it in another order is corrected automatically, with a warning.
+  #      The reason: proportions must be computed over the samples that survived,
+  #      ordering must know which samples are in this round, and anything running
+  #      after the ordering stage would destroy its output.
+  #   2. Exactly one stage takes this round's budget. A select stage with
+  #      mode: filter only shrinks the pool and does not take it; mode: draw takes
+  #      it. If no stage takes it, the pipeline appends a uniform draw.
+  #
+  # loss space stages (weighters, and mixers that reweight by domain, like DoReMi) multiply their weights:
+  #   L = mean_i ( prod_k w_i^(k) * l_i )
+
+  # Three-step description: coarse filter -> domain-level proportions -> sample-level reweighting, and insert reorder at the 2.5 position.
+  hierarchical:
+    name: hierarchical
+    params:
+      cache_dir: ../dataflex_saves/lego_output
+      score_batch_size: 8      # shared scoring batch size
+      save_plans: false        # true will save the scoreboard for each round
+      stages:
+        # Step 1: coarse-grained filter, remove redundant data and reduce the scoring overhead of subsequent stages
+        - family: selector
+          component: loss
+          mode: filter         # filter=only shrink the pool; draw=take the budget
+          keep_ratio: 0.5
+          warmup_step: 10
+          every: 200
+        # Step 2: domain-level budget allocation
+        - family: mixer
+          component: odm
+          every: 50
+        # Step 2.5: domain-internal/overall order
+        - family: reorder
+          component: dynamic_saw
+          every: 50
+        # Step 3: sample-level reweighting
+        - family: weighter
+          component: loss
+          warmup_step: 10
+
+  # Minimum combination: filter first, then sort. Both work on a single train_dataset, no need for multi-domain data.
+  select_then_reorder:
+    name: select_then_reorder
+    params:
+      cache_dir: ../dataflex_saves/lego_output
+      stages:
+        - family: selector
+          component: loss
+          mode: filter
+          keep_ratio: 0.5
+          warmup_step: 10
+          every: 100
+        - family: reorder
+          component: dynamic_saw
+          every: 20
+
+  # Domain-level proportions + sample-level reweighting: two different levels of weighting stacked together.
+  # If the mixer is doremi, it will also register as a contributor to the loss space, so here it is "domain weight x sample weight" multiplication, not mutually exclusive.
+  mix_then_weight:
+    name: mix_then_weight
+    params:
+      cache_dir: ../dataflex_saves/lego_output
+      stages:
+        - family: mixer
+          component: odm
+          every: 50
+        - family: weighter
+          component: loss
+          warmup_step: 10
+
+  # Pipeline with only one stage, equivalent to the corresponding dedicated trainer.
+  # Mainly used for comparison: when running a single family, the combination path should be consistent with dynamic_select.
+  select_only:
+    name: select_only
+    params:
+      cache_dir: ../dataflex_saves/lego_output
+      stages:
+        - family: selector
+          component: loss
+          mode: draw           # when used alone, it takes the budget for the entire round
+          warmup_step: 10
+          every: 1

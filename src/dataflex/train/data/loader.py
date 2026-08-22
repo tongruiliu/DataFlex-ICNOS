@@ -4,7 +4,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Literal, Optional, Union
 
 import numpy as np
-from datasets import Dataset, load_dataset, load_from_disk
+from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
+from torch.utils.data import Dataset as TorchDataset
 
 from llamafactory.extras.constants import FILEEXT2TYPE
 from llamafactory.extras.misc import check_version, has_tokenized_data
@@ -333,3 +334,132 @@ def make_reorder_get_dataset(reorder_factory):
         return dataset_module
 
     return reorder_get_dataset
+
+
+# ======================================================================
+# Lego
+# ======================================================================
+
+
+class DomainLabeledDataset(TorchDataset):
+    """A single dataset that still knows which domain each row came from.
+
+    The mixture path represents a domain as its own dataset object, which forces
+    `train_dataset = None` and leaves selectors and reorders with nothing to
+    index into. Composition needs the opposite arrangement: one concatenated
+    dataset plus a label per row, so that "allocate a quota per domain" is index
+    arithmetic over groups and every other family keeps working unchanged.
+
+    `domain_id` is injected per item because DoReMi reads it in `compute_loss`
+    and ODM reads it to attribute its bandit reward.
+    """
+
+    def __init__(self, dataset, domain_ids):
+        self.dataset = dataset
+        self.domain_ids = np.asarray(domain_ids, dtype=np.int64)
+        if len(self.domain_ids) != len(dataset):
+            raise ValueError(
+                f"domain_ids has {len(self.domain_ids)} entries but the dataset has {len(dataset)} rows"
+            )
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        if isinstance(item, dict):
+            return {**item, "domain_id": int(self.domain_ids[idx])}
+        return item
+
+    @property
+    def column_names(self):
+        # Some LlamaFactory paths sniff this to decide whether to prune columns.
+        names = getattr(self.dataset, "column_names", None)
+        return (list(names) + ["domain_id"]) if names else None
+
+
+def lego_get_dataset(
+    template: "Template",
+    model_args: "ModelArguments",
+    data_args: "DataArguments",
+    training_args: "Seq2SeqTrainingArguments",
+    stage: Literal["pt", "sft", "rm", "ppo", "kto"],
+    tokenizer: "PreTrainedTokenizer",
+    processor: Optional["ProcessorMixin"] = None,
+) -> "DatasetModule":
+    r"""Build one concatenated training set plus a per-sample domain label.
+
+    Reuses LlamaFactory's own loading and preprocessing, then concatenates the
+    per-source datasets in the order they appear in `dataset:` so that domain
+    index order matches `init_mixture_proportions`. Unlike the mixture path this
+    returns a real `train_dataset`, samples nothing, and shuffles nothing —
+    all of that is the pipeline's job.
+    """
+    if data_args.streaming:
+        raise ValueError("[Dataflex][Lego] composition requires `streaming: false`.")
+
+    with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
+        per_source_raw = _get_merged_dataset(
+            data_args.dataset, model_args, data_args, training_args, stage, return_dict=True
+        )
+        eval_dataset = _get_merged_dataset(
+            data_args.eval_dataset,
+            model_args,
+            data_args,
+            training_args,
+            stage,
+            return_dict=data_args.eval_on_each_dataset,
+        )
+
+    with training_args.main_process_first(desc="pre-process dataset", local=(not data_args.data_shared_file_system)):
+        per_source_pp = {
+            name: _get_preprocessed_dataset(
+                ds, data_args, training_args, stage, template, tokenizer, processor, is_eval=False
+            )
+            for name, ds in (per_source_raw or {}).items()
+        }
+
+        if isinstance(eval_dataset, dict):
+            for eval_name, eval_data in eval_dataset.items():
+                eval_dataset[eval_name] = _get_preprocessed_dataset(
+                    eval_data, data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+                )
+        else:
+            eval_dataset = _get_preprocessed_dataset(
+                eval_dataset, data_args, training_args, stage, template, tokenizer, processor, is_eval=True
+            )
+
+        domain_names = list(per_source_pp.keys())
+        sizes = [len(per_source_pp[name]) for name in domain_names]
+        domain_ids = np.concatenate(
+            [np.full(n, i, dtype=np.int64) for i, n in enumerate(sizes)]
+        ) if sizes else np.zeros(0, dtype=np.int64)
+
+        if len(domain_names) == 1:
+            train_dataset = per_source_pp[domain_names[0]]
+        else:
+            train_dataset = concatenate_datasets([per_source_pp[name] for name in domain_names])
+
+        if data_args.val_size > 1e-6:
+            raise ValueError(
+                "[Dataflex][Lego] `val_size > 0` splits with a shuffle, which breaks the alignment "
+                "between domain_ids and train_dataset. Use a separate `eval_dataset`."
+            )
+
+        dataset_dict = split_dataset(train_dataset, eval_dataset, data_args, seed=training_args.seed)
+        dataset_module = get_dataset_module(dataset_dict)
+
+    plan = list(zip(domain_names, sizes))
+    logger.info_rank0(
+        f"[Dataflex][Lego] domains in `dataset:` order (name, rows): {plan}; total={sum(sizes)}"
+    )
+
+    # Only wrap when there is something to attribute; a single-domain run does
+    # not need the per-item dict copy.
+    if len(domain_names) > 1:
+        dataset_module["train_dataset"] = DomainLabeledDataset(dataset_module["train_dataset"], domain_ids)
+        logger.info_rank0("[Dataflex][Lego] train_dataset wrapped to carry domain_id per sample.")
+
+    dataset_module["domain_ids"] = domain_ids
+    dataset_module["domain_names"] = domain_names
+    return dataset_module

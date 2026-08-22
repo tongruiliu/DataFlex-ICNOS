@@ -1,0 +1,50 @@
+### model
+model_name_or_path: Qwen/Qwen3-1.7B-Base
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z2_config.json
+
+### dataset
+# Single dataset can also run combinations: select and reorder both only need one train_dataset.
+# When there are no multiple domains, the mixer stage has nothing to do, so mixer is not included in this preset.
+dataset: alpaca_en_demo
+template: qwen
+cutoff_len: 2048
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+seed: 42
+val_size: 0
+packing: false
+
+### output
+output_dir: ../dataflex_saves/Qwen3-1.7B/lego_select_reorder
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+report_to: none
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+
+### Dataflex args
+train_type: dynamic_lego
+components_cfg_file: src/dataflex/configs/components.yaml
+component_name: select_then_reorder
+warmup_step: 10
+update_step: 50
+update_times: 20
+
+# Because the pipeline has a reorder stage, LegoTrainer will force SequentialSampler
+# ——the order of the plan is the curriculum, any shuffle sampler will silently discard it.

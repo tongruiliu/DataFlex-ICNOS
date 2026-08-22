@@ -1,0 +1,59 @@
+### model
+model_name_or_path: Qwen/Qwen3-1.7B-Base
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z2_config.json
+
+### dataset
+# Multiple datasets = multiple domains. The order of `dataset:` defines the domain index, which must match the order of `init_mixture_proportions` in the mixer preset.
+dataset: math,code,orca
+template: qwen
+cutoff_len: 2048
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+seed: 42
+
+# Constraints for combined paths (lego_get_dataset checks the first two and raises an error):
+#   - val_size must be 0: train_test_split shuffles domain_ids to align with datasets
+#   - streaming must be false
+#   - mix_strategy must be concat
+#   - num_samples in dataset_info.json must not be set (unseeded random permutation)
+val_size: 0
+mix_strategy: concat
+packing: false
+
+### output
+output_dir: ../dataflex_saves/Qwen3-1.7B/lego_hierarchical
+logging_steps: 10
+save_steps: 500
+plot_loss: true
+overwrite_output_dir: true
+report_to: none
+
+### train
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8
+learning_rate: 2.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+
+### Dataflex args
+train_type: dynamic_lego
+components_cfg_file: src/dataflex/configs/components.yaml
+component_name: hierarchical   # preset name in pipelines: in components.yaml
+                               # other options: select_then_reorder / mix_then_weight / select_only
+warmup_step: 10
+update_step: 50                # every 50 steps is a planning boundary, pipeline rebuilds plan here
+update_times: 20               # to run a full round, let warmup_step + update_step*update_times
+                               # approximately equal to len(dataset) / (per_device_bs * grad_accum * world_size)
+
+# warmup_step / every for each stage is configured in pipelines: in components.yaml
+# the update_step here only determines "how often to check if a stage is due".
