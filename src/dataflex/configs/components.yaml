@@ -67,12 +67,15 @@ selectors:
     params:
       cache_dir: ../dataflex_saves/loss_output
       focus: "medium"
+      # Scoring is batch-invariant, so this only trades memory for speed.
+      score_batch_size: 8
 
   delta_loss:
     name: delta_loss
     params:
       cache_dir: ../dataflex_saves/delta_loss_output
       window_size: 0.2
+      score_batch_size: 8
 
   tsds:
     name: tsds

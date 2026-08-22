@@ -1,4 +1,5 @@
 import torch
+import math
 import os
 import json
 import numpy as np
@@ -8,31 +9,34 @@ import torch.distributed as dist
 from dataflex.core.registry import register_selector
 from .base_selector import Selector
 from dataflex.utils.logging import logger
+from dataflex.utils.loss_utils import UNSCORED, per_sample_loss_from_outputs
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 
 def sigmoid(x, k):
     return 1 / (1 + np.exp(-k * (x - 0.5)))
 
-# 计算窗口位置
+# Compute the window position based on the current update times and the total update times.
 def calculate_window_position(current_update_times, update_times, dataset_len, window_size=0.2, k=10):
     scaled_iteration = current_update_times / update_times
 
     delta = sigmoid(scaled_iteration, k) * (dataset_len - window_size * dataset_len)
     
-    # 计算窗口的起始和结束位置
+    # Compute the window start and end position.
     window_start = delta
     window_end = delta + window_size * dataset_len
     return int(window_start), int(window_end)
 
 
 class IndexedDataset(Dataset):
-    def __init__(self, original_dataset):
+    def __init__(self, original_dataset, indices=None):
         self.dataset = original_dataset
-    
+        self.indices = list(indices) if indices is not None else None
+
     def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, index):
+        return len(self.indices) if self.indices is not None else len(self.dataset)
+
+    def __getitem__(self, i):
+        index = self.indices[i] if self.indices is not None else i
         data = self.dataset[index]
         return {"idx": index, **data}
 
@@ -44,20 +48,43 @@ class DeltaLossSelector(Selector):
         accelerator,
         data_collator,
         cache_dir,
-        window_size: float = 0.2,         # 窗口大小，默认20%
+        window_size: float = 0.2,         # Window size, default 20%
+        score_batch_size: int = 1,        # Samples per scoring forward pass
+        score_num_workers: int = 2,       # DataLoader workers for scoring
     ):
         super().__init__(dataset, accelerator, data_collator, cache_dir)
         self.seed = 42
         self.window_size = window_size
-        self.initial_losses = None
         self.first_time = True
         self.path_to_initial_losses = None
+        self.score_batch_size = int(score_batch_size)
+        self.score_num_workers = int(score_num_workers)
 
-    def compute_loss(self, dataloader, model, step_id):
+    def _compute_losses(self, positions, model, step_id: int):
+        """Per-sample loss for `positions`, one value per position.
+
+        Same change as in LossSelector: reading `model(...).loss` pinned scoring
+        to `batch_size=1` because that value is a batch mean. Going through
+        logits+labels makes the result independent of how the pool is batched.
+        """
+        positions = list(positions)
+        if not positions:
+            return []
+
+        dataloader = DataLoader(
+            IndexedDataset(self.dataset, positions),
+            batch_size=self.score_batch_size,
+            shuffle=False,
+            num_workers=self.score_num_workers,
+            collate_fn=self.data_collator,
+        )
         dataloader = self.accelerator.prepare(dataloader)
-        n = len(self.dataset)
-        # 2) 本地收集 loss 与 idx
-        logger.info(f"[Dataflex] Calculating loss using {self.accelerator.num_processes} GPUs")
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                f"[Dataflex] Calculating loss for {len(positions)} samples using "
+                f"{self.accelerator.num_processes} GPUs (batch_size={self.score_batch_size})"
+            )
         local_losses, local_indices = [], []
         for batch in tqdm(
             dataloader,
@@ -71,48 +98,63 @@ class DeltaLossSelector(Selector):
             idx = idx.view(-1).to(dtype=torch.long)
 
             with torch.no_grad():
-                # 注意从 batch 中移除 'idx' 再喂给模型
-                model_inputs = {k: v for k, v in batch.items() if k != "idx"}
-                loss = model(**model_inputs).loss.detach().view(-1)  # [B]
+                model_inputs = {k: v for k, v in batch.items() if k not in ("idx", "domain_id")}
+                outputs = model(**model_inputs)
+                loss = per_sample_loss_from_outputs(outputs, model_inputs).view(-1)
 
-            local_losses.append(loss)
+            local_losses.append(loss.float())
             local_indices.append(idx)
 
-        local_losses  = torch.cat(local_losses,  dim=0)  # [N_local_padded]
-        local_indices = torch.cat(local_indices, dim=0)  # [N_local_padded]
-
-        # 3) 各进程 gather（按 rank 串联，可能含补齐/重复）
-        all_losses  = self.accelerator.gather(local_losses)
-        all_indices = self.accelerator.gather(local_indices)
-
-        # 4) 主进程按 idx 去重并对齐到 len(dataset)
-        if self.accelerator.is_main_process:
-            aligned = torch.full((n,), float("inf"), dtype=all_losses.dtype, device=all_losses.device)
-            seen = set()
-            # 采用“首次出现优先”保证确定性
-            for l, i in zip(all_losses.tolist(), all_indices.tolist()):
-                if 0 <= i < n and i not in seen:
-                    aligned[i] = l
-                    seen.add(i)
-            # 若极端情况下有没覆盖到的 idx，仍为 +inf；不会进 largest=True 的 topk
-            gathered_losses = aligned
-            logger.info(f"[Dataflex] Loss calculation finished")
+        if local_losses:
+            local_losses = torch.cat(local_losses, dim=0)
+            local_indices = torch.cat(local_indices, dim=0)
         else:
-            gathered_losses = None
-        return gathered_losses
+            local_losses = torch.zeros(0, device=self.accelerator.device)
+            local_indices = torch.zeros(0, dtype=torch.long, device=self.accelerator.device)
+
+        all_losses = self.accelerator.gather(local_losses).detach().cpu().tolist()
+        all_indices = self.accelerator.gather(local_indices).detach().cpu().tolist()
+
+        # gather pads the last batch, so the same idx can come back more than
+        # once; keeping the first occurrence makes the result independent of the
+        # world size. Non-finite values are left out so that a duplicate
+        # carrying a real number can still fill the index in, and anything still
+        # missing afterwards reads as UNSCORED.
+        by_index = {}
+        for value, i in zip(all_losses, all_indices):
+            i = int(i)
+            if i not in by_index and math.isfinite(value):
+                by_index[i] = float(value)
+
+        if self.accelerator.is_main_process:
+            logger.info(f"[Dataflex] Loss calculation finished")
+        return [by_index.get(p, UNSCORED) for p in positions]
+
+    def _dense_baseline(self, positions, scores):
+        """Baseline laid out over the whole dataset, UNSCORED where missing.
+
+        Kept dense so the on-disk format stays what it was (a list of length
+        `len(dataset)` under `metric["loss"]`) and so it can be looked up by
+        dataset index later, even if a pool restricted what was scored.
+        """
+        dense = np.full(len(self.dataset), UNSCORED, dtype=np.float64)
+        for p, v in zip(positions, scores):
+            dense[p] = v
+        return dense
 
     def select(self, model, step_id: int, num_samples: int, **kwargs):
         model.eval()
         os.makedirs(self.cache_dir, exist_ok=True)
         save_path = os.path.join(self.cache_dir, f"step_{step_id}.json")
 
-        n = len(self.dataset)
+        positions = self.candidate_positions()
+        n = len(positions)
 
-        # ========= 第一次调用select，计算并保存 initial_losses =========
+        # ========= First call to select, calculate and save initial_losses =========
         if self.first_time == True:
             self.first_time = False
             self.path_to_initial_losses = save_path
-            # 读取并在main中广播
+            # Read and broadcast in main
             if os.path.exists(save_path):
                 if self.accelerator.is_main_process:
                     cached_indices, _ = load_cached_selection(save_path)
@@ -125,16 +167,10 @@ class DeltaLossSelector(Selector):
                 else:
                     cached_indices = cached_indices or []
                 return cached_indices
-            
+
             logger.info(f"[Dataflex] Calculating initial losses...")
-            dataloader = DataLoader(
-                IndexedDataset(self.dataset),
-                batch_size=1,            
-                shuffle=False,
-                num_workers=2,
-                collate_fn=self.data_collator, 
-            )
-            gathered_losses = self.compute_loss(dataloader, model, step_id)
+            scores = self._scores_for(positions, model, step_id)
+
             if self.accelerator.is_main_process:
                 logger.info(f"[Dataflex] Got initial_losses. Return random warmup selection.")
                 gen = torch.Generator()
@@ -143,27 +179,25 @@ class DeltaLossSelector(Selector):
                     raise ValueError(
                         f"Cannot sample {num_samples} without replacement from {n} samples"
                     )
-                full_indices = torch.randperm(n, generator=gen)[:num_samples].tolist()
-                sel = full_indices
-                metric_payload = {
-                    "loss": gathered_losses.tolist()
-                }
-                # 只有main中才会保存
+                picked = torch.randperm(n, generator=gen)[:num_samples].tolist()
+                sel = [positions[i] for i in picked]
+                metric_payload = {"loss": self._dense_baseline(positions, scores).tolist()}
+                # Only save in main
                 save_selection(save_path, sel, metric_payload, self.accelerator)
-                
-            else:
-                full_indices = None
 
-            obj = [full_indices]
+            else:
+                sel = None
+
+            obj = [sel]
             if dist.is_available() and dist.is_initialized():
                 dist.broadcast_object_list(obj, src=0)
-                full_indices = obj[0]
+                sel = obj[0]
             else:
-                full_indices = full_indices or []
+                sel = sel or []
 
-            return full_indices
+            return sel
         
-        # ========= 后续调用 select，根据 delta_loss 选择样本 =========
+        # ========= Subsequent call to select, select samples based on delta_loss =========
         
         if os.path.exists(save_path):
             if self.accelerator.is_main_process:
@@ -177,48 +211,45 @@ class DeltaLossSelector(Selector):
             else:
                 cached_indices = cached_indices or []
             return cached_indices
+
         logger.info(f"[Dataflex] Calculating current losses...")
-        dataloader = DataLoader(
-            IndexedDataset(self.dataset),
-            batch_size=1,            
-            shuffle=False,
-            num_workers=2,
-            collate_fn=self.data_collator, 
-        )
-        
-        gathered_losses = self.compute_loss(dataloader, model, step_id)
-        
-        # ========= 广播 current_losses（等长张量） =========
-        # losses_list = [gathered_losses if self.accelerator.is_main_process else None]
-        # dist.broadcast_object_list(losses_list, src=0)
-        # current_losses = losses_list[0]
-        current_losses = gathered_losses
-        # ========= Delta Loss 选择 =========
+        current_scores = self._scores_for(positions, model, step_id)
+
+        # ========= Delta Loss selection =========
         if self.accelerator.is_main_process:
             logger.info(f"[Dataflex] Loading initial losses from {self.path_to_initial_losses}")
-            
-            cached_indices, metrics = load_cached_selection(self.path_to_initial_losses)
-            
-            self.initial_losses = torch.tensor(metrics["loss"], dtype=torch.float32)
+
+            _, metrics = load_cached_selection(self.path_to_initial_losses)
+            baseline = np.asarray(metrics["loss"], dtype=np.float64)
+            # Caches written before the sentinel was unified hold +inf for
+            # entries that were never scored, and an infinite loss is not a
+            # usable measurement either way. Normalising them here keeps both
+            # file formats on the one code path below.
+            baseline[~np.isfinite(baseline)] = UNSCORED
 
             logger.info(f"[Dataflex] Selecting samples based on delta loss.")
-            
-            # 计算损失差（delta loss）
-            delta_loss = self.initial_losses.to(current_losses.device) - current_losses
 
-            # 排序索引
+            # Calculate delta loss, only compare on candidate pool
+            initial = torch.tensor(baseline[np.asarray(positions, dtype=np.int64)], dtype=torch.float32)
+            current = torch.tensor(current_scores, dtype=torch.float32)
+            delta_loss = initial - current
+            # An unknown score on either side leaves the difference unknown, and
+            # those samples sort last so the window never reaches them.
+            delta_loss = torch.nan_to_num(delta_loss, nan=float("-inf"))
+
+            # Sort indices
             sorted_indices = torch.argsort(delta_loss, descending=True)
 
-            # 计算滑动窗口的位置
+            # Calculate sliding window position
             window_start, window_end = calculate_window_position(kwargs["current_update_times"]-1, kwargs["update_times"]-1, n, window_size=self.window_size)
             invalid_position = (delta_loss[sorted_indices] < 0).nonzero()
             if len(invalid_position) > 0:
-                invalid_position = invalid_position[0].item()  # 获取第一个小于0的位置
-                window_end = min(window_end, invalid_position)  # 设置窗口右端点
+                invalid_position = invalid_position[0].item()  # Get the first position less than 0
+                window_end = min(window_end, invalid_position)  # Set window right endpoint
             
-            # 输出选择次数、窗口位置
+            # Output selection times, window position
             logger.info(f"[Dataflex] Step {step_id}, Update {kwargs['current_update_times']-1}/{kwargs['update_times']-1}, Window position: [{window_start}, {window_end})")
-            # 输出窗口内最大的和最小的五个delta loss及其索引
+            # Output the largest and smallest five delta loss and their indices in the window
             window_delta_loss = delta_loss[sorted_indices][window_start:window_end]
             if len(window_delta_loss) > 0:
                 logger.info(f"[Dataflex] Window delta loss stats:")
@@ -226,41 +257,42 @@ class DeltaLossSelector(Selector):
                 logger.info(f"  Min 5: {window_delta_loss[-5:].cpu().numpy()}")
             probs = torch.full((len(delta_loss),), 0.025, device=delta_loss.device)
 
-            # 设置窗口内的样本的概率较大
+            # Set the probability of samples in the window to be larger
             selected = sorted_indices[window_start:window_end]
             probs[selected] = 1.0
 
-            # 归一化概率
-            probs = probs / probs.sum()  # 归一化概率，使总和为1
+            # Normalize probability
+            probs = probs / probs.sum()  # Normalize probability, make the sum to be 1
 
             available = int((probs > 0).sum().item())
             effective_replacement = False
             
-            # 如果有效样本量小于请求样本数，使用放回采样
+            # If the effective sample size is less than the requested sample size, use replacement sampling
             if not effective_replacement and num_samples > available:
                 effective_replacement = True
                 logger.info(
-                    f"[Dataflex] 有效样本量 {available} 小于请求数量 {num_samples}，"
-                    f"已自动改为放回采样。"
+                    f"[Dataflex] Effective sample size {available} is less than the requested number {num_samples},"
+                    f"automatically changed to replacement sampling."
                 )
 
-            # 创建随机数生成器
+            # Create random number generator
             gen = torch.Generator()
             gen.manual_seed(self.seed + int(step_id))
             
-            # 使用torch.multinomial进行采样
-            sel_tensor = torch.multinomial(probs.cpu(), num_samples=num_samples,
-                                        replacement=effective_replacement, generator=gen)
-            sel = sel_tensor.tolist()
+            # Use torch.multinomial for sampling
+            picked = torch.multinomial(probs.cpu(), num_samples=num_samples,
+                                       replacement=effective_replacement, generator=gen).tolist()
+            # multinomial gives the indices in the candidate pool, map back to the dataset indices
+            sel = [positions[i] for i in picked]
 
-            # ========= 4) 保存（只保存“被选中的 indices + 对应 metric”） =========
+            # ========= Save (only save "selected indices + corresponding metric") =========
             metric_payload = {
-                "delta_loss": [float(delta_loss[i].item()) for i in sel]
+                "delta_loss": [float(delta_loss[i].item()) for i in picked]
             }
             save_selection(save_path, sel, metric_payload, self.accelerator)
         else:
             sel = None
-        # 广播选择的样本
+        # Broadcast selected samples
         sel_list = [sel]
         if dist.is_available() and dist.is_initialized():
             dist.broadcast_object_list(sel_list, src=0)

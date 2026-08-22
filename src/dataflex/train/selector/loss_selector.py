@@ -1,8 +1,10 @@
 from dataflex.core.registry import register_selector
 from dataflex.utils.selector_io import load_cached_selection, save_selection
 from dataflex.utils.logging import logger
+from dataflex.utils.loss_utils import UNSCORED, per_sample_loss_from_outputs
 from .base_selector import Selector
 
+import math
 import torch
 import torch.distributed as dist
 from tqdm import tqdm
@@ -11,13 +13,15 @@ import json
 import os
 
 class IndexedDataset(Dataset):
-    def __init__(self, original_dataset):
+    def __init__(self, original_dataset, indices=None):
         self.dataset = original_dataset
-    
+        self.indices = list(indices) if indices is not None else None
+
     def __len__(self):
-        return len(self.dataset)
-    
-    def __getitem__(self, index):
+        return len(self.indices) if self.indices is not None else len(self.dataset)
+
+    def __getitem__(self, i):
+        index = self.indices[i] if self.indices is not None else i
         data = self.dataset[index]
         return {"idx": index, **data}
 
@@ -30,54 +34,55 @@ class LossSelector(Selector):
         data_collator,
         cache_dir,
         focus: str = "high",              # "high" | "medium" | "low"
-        focus_weight: float = 5.0,        # 权重倍数
-        quantiles: tuple = (0.33, 0.66),  # 低/中/高切分点
-        replacement: bool = False,        # 是否放回采样
-        temperature: float = 1.0,         # 温度控制
+        focus_weight: float = 5.0,        # Weight multiplier
+        quantiles: tuple = (0.33, 0.66),  # Low/medium/high quantiles
+        replacement: bool = False,        # Whether to use replacement sampling
+        temperature: float = 1.0,         # Temperature control
+        score_batch_size: int = 1,        # Samples per scoring forward pass
+        score_num_workers: int = 2,       # DataLoader workers for scoring
     ):
         super().__init__(dataset, accelerator, data_collator, cache_dir)
 
-        # 新增的采样控制参数
+        # New sampling control parameters
         self.focus = str(focus).lower()
         if self.focus not in {"low", "medium", "high"}:
-            raise ValueError("focus 必须是 'low'、'medium' 或 'high'")
+            raise ValueError("focus must be 'low', 'medium' or 'high'")
         self.focus_weight = focus_weight
         self.quantiles = quantiles
         self.replacement = replacement
         self.temperature = temperature
+        self.score_batch_size = int(score_batch_size)
+        self.score_num_workers = int(score_num_workers)
 
         logger.info(f"LossSelector initialized.")
 
-    def select(self, model, step_id: int, num_samples: int, **kwargs):
-        model.eval()
-        os.makedirs(self.cache_dir, exist_ok=True)
-        save_path = os.path.join(self.cache_dir, f"step_{step_id}.json")
-        n = len(self.dataset)
-        if os.path.exists(save_path):
-            if self.accelerator.is_main_process:
-                cached_indices, _ = load_cached_selection(save_path)
-            else:
-                cached_indices = None
-            cached_indices_list = [cached_indices]
-            if dist.is_available() and dist.is_initialized():
-                dist.broadcast_object_list(cached_indices_list, src=0)
-                cached_indices = cached_indices_list[0]
-            else:
-                cached_indices = cached_indices or []
-            return cached_indices
-        
-        # 1) DataLoader
+    def _compute_losses(self, positions, model, step_id: int):
+        """Per-sample loss for `positions`, one value per position.
+
+        The old implementation was pinned to `batch_size=1` because it read
+        `model(**inputs).loss`, which is a batch *mean* and only coincides with
+        the per-sample loss when the batch holds one sample. Going through
+        logits+labels makes the result independent of how the pool is batched,
+        so `score_batch_size` above 1 is a pure speedup.
+        """
+        positions = list(positions)
+        if not positions:
+            return []
+
         dataloader = DataLoader(
-            IndexedDataset(self.dataset),
-            batch_size=1,            
+            IndexedDataset(self.dataset, positions),
+            batch_size=self.score_batch_size,
             shuffle=False,
-            num_workers=2,
-            collate_fn=self.data_collator, 
+            num_workers=self.score_num_workers,
+            collate_fn=self.data_collator,
         )
         dataloader = self.accelerator.prepare(dataloader)
 
-        # 2) 本地收集 loss 与 idx
-        logger.info(f"[Dataflex] Calculating loss using {self.accelerator.num_processes} GPUs")
+        if self.accelerator.is_main_process:
+            logger.info(
+                f"[Dataflex] Calculating loss for {len(positions)} samples using "
+                f"{self.accelerator.num_processes} GPUs (batch_size={self.score_batch_size})"
+            )
         local_losses, local_indices = [], []
         for batch in tqdm(
             dataloader,
@@ -91,48 +96,67 @@ class LossSelector(Selector):
             idx = idx.view(-1).to(dtype=torch.long)
 
             with torch.no_grad():
-                # 注意从 batch 中移除 'idx' 再喂给模型
-                model_inputs = {k: v for k, v in batch.items() if k != "idx"}
-                loss = model(**model_inputs).loss.detach().view(-1)  # [B]
+                model_inputs = {k: v for k, v in batch.items() if k not in ("idx", "domain_id")}
+                outputs = model(**model_inputs)
+                loss = per_sample_loss_from_outputs(outputs, model_inputs).view(-1)
 
-            local_losses.append(loss)
+            local_losses.append(loss.float())
             local_indices.append(idx)
 
-        local_losses  = torch.cat(local_losses,  dim=0)  # [N_local_padded]
-        local_indices = torch.cat(local_indices, dim=0)  # [N_local_padded]
-
-        # 3) 各进程 gather（按 rank 串联，可能含补齐/重复）
-        all_losses  = self.accelerator.gather(local_losses)
-        all_indices = self.accelerator.gather(local_indices)
-
-        # 4) 主进程按 idx 去重并对齐到 len(dataset)
-        if self.accelerator.is_main_process:
-            aligned = torch.full((n,), float("inf"), dtype=all_losses.dtype, device=all_losses.device)
-            seen = set()
-            # 采用“首次出现优先”保证确定性
-            for l, i in zip(all_losses.tolist(), all_indices.tolist()):
-                if 0 <= i < n and i not in seen:
-                    aligned[i] = l
-                    seen.add(i)
-            # 若极端情况下有没覆盖到的 idx，仍为 +inf；不会进 largest=True 的 topk
-            gathered_losses = aligned
-            logger.info(f"[Dataflex] Loss calculation finished")
+        if local_losses:
+            local_losses = torch.cat(local_losses, dim=0)
+            local_indices = torch.cat(local_indices, dim=0)
         else:
-            gathered_losses = None
-    
-        # ========= 广播 gathered_losses（等长张量） =========
-        # gathered_list = [gathered_losses if self.accelerator.is_main_process else None]
-        # dist.broadcast_object_list(gathered_list, src=0)
-        # gathered_losses = gathered_list[0]
-    
-        # ========= 主进程：基于分布的采样 =========
+            local_losses = torch.zeros(0, device=self.accelerator.device)
+            local_indices = torch.zeros(0, dtype=torch.long, device=self.accelerator.device)
+
+        all_losses = self.accelerator.gather(local_losses).detach().cpu().tolist()
+        all_indices = self.accelerator.gather(local_indices).detach().cpu().tolist()
+
+        # gather pads the last batch, so the same idx can come back more than
+        # once; keeping the first occurrence makes the result independent of the
+        # world size. Non-finite values are left out so that a duplicate
+        # carrying a real number can still fill the index in, and anything still
+        # missing afterwards reads as UNSCORED.
+        by_index = {}
+        for value, i in zip(all_losses, all_indices):
+            i = int(i)
+            if i not in by_index and math.isfinite(value):
+                by_index[i] = float(value)
+
+        if self.accelerator.is_main_process:
+            logger.info(f"[Dataflex] Loss calculation finished")
+        return [by_index.get(p, UNSCORED) for p in positions]
+
+    def select(self, model, step_id: int, num_samples: int, **kwargs):
+        model.eval()
+        os.makedirs(self.cache_dir, exist_ok=True)
+        save_path = os.path.join(self.cache_dir, f"step_{step_id}.json")
+        if os.path.exists(save_path):
+            if self.accelerator.is_main_process:
+                cached_indices, _ = load_cached_selection(save_path)
+            else:
+                cached_indices = None
+            cached_indices_list = [cached_indices]
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast_object_list(cached_indices_list, src=0)
+                cached_indices = cached_indices_list[0]
+            else:
+                cached_indices = cached_indices or []
+            return cached_indices
+
+        # Only score the candidate pool. When used independently, the candidate pool is the entire dataset; when combined with other stages, the upstream may have already filtered out most data, so it's not necessary to calculate the loss for them again.
+        positions = self.candidate_positions()
+        scores = self._scores_for(positions, model, step_id)
+
+        # ========= Main process: sampling based on distribution =========
         if self.accelerator.is_main_process:
             logger.info(f"[Dataflex] focus={self.focus}, focus_weight={self.focus_weight}")
-            losses = gathered_losses.clone().detach().float()
+            losses = torch.tensor(scores, dtype=torch.float32)
             valid_mask = torch.isfinite(losses)
 
             if valid_mask.sum().item() == 0:
-                probs = torch.full((len(losses),), 1.0 / len(losses))
+                probs = torch.full((len(losses),), 1.0 / max(1, len(losses)))
             else:
                 valid_losses = losses[valid_mask]
                 q1 = torch.quantile(valid_losses, self.quantiles[0])
@@ -166,32 +190,31 @@ class LossSelector(Selector):
             if not effective_replacement and num_samples > available:
                 effective_replacement = True
                 logger.info(
-                    f"[Dataflex] 有效样本量 {available} 小于请求数量 {num_samples}，"
-                    f"已自动改为放回采样。"
+                    f"[Dataflex] Effective sample size {available} is less than the requested number {num_samples},"
+                    f"automatically changed to replacement sampling."
                 )
 
             gen = torch.Generator()
             gen.manual_seed(self.seed + int(step_id))
-            sel_tensor = torch.multinomial(
+            picked = torch.multinomial(
                 probs.cpu(), num_samples=num_samples,
                 replacement=effective_replacement, generator=gen
-            )
-            sel = sel_tensor.tolist()
+            ).tolist()
+            # multinomial gives the indices in the candidate pool, map back to the dataset indices
+            sel = [positions[i] for i in picked]
 
-            # ========= 4) 保存（只保存“被选中的 indices + 对应 metric”） =========
-            metric_payload = {
-                "loss": [float(losses[i].item()) for i in sel]
-            }
+            # ========= Save (only save "selected indices + corresponding metric") =========
+            metric_payload = {"loss": [float(scores[i]) for i in picked]}
             save_selection(save_path, sel, metric_payload, self.accelerator)
         else:
             sel = None
 
-        # 广播 sel
+        # Broadcast selected samples
         sel_list = [sel]
         if dist.is_available() and dist.is_initialized():
             dist.broadcast_object_list(sel_list, src=0)
             sel = sel_list[0]
         else:
             sel = sel or []
-            
+
         return sel
