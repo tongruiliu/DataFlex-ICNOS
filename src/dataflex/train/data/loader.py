@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Literal, Optional, Union
 
 import numpy as np
-from datasets import Dataset, concatenate_datasets, load_dataset, load_from_disk
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from torch.utils.data import Dataset as TorchDataset
 
 from llamafactory.extras.constants import FILEEXT2TYPE
@@ -45,6 +45,19 @@ from ..dataset.mixed_proportion_manager import MixedProportionManager
 #: Written last, so a half-finished snapshot is never mistaken for a usable one.
 _SNAPSHOT_MANIFEST = "dataflex_tokenized.json"
 _SNAPSHOT_FORMAT = "dataflex-domains-v1"
+
+
+def _split_dataset(dataset, eval_dataset, data_args, seed) -> "DatasetDict":
+    """LlamaFactory >=0.9.5 returns `(train_dict, eval_dict)`; older versions return a `DatasetDict`.
+
+    Without this, `get_dataset_module` takes the tuple through its untyped
+    `else: # single dataset` branch and hands it back as `train_dataset`, which
+    raises nothing and yields a 2-sample training set.
+    """
+    out = split_dataset(dataset, eval_dataset, data_args, seed=seed)
+    if isinstance(out, tuple):
+        return DatasetDict({**out[0], **out[1]})
+    return out
 
 
 def _snapshot_signature(model_args, data_args, stage) -> dict:
@@ -255,7 +268,7 @@ def get_dataset(
         if data_args.tokenized_path is not None and training_args.should_save:
             _save_tokenized_domains(data_args.tokenized_path, per_source_pp, eval_dataset, signature)
 
-    dataset_dict = split_dataset(
+    dataset_dict = _split_dataset(
         _merged_train_set(per_source_pp, data_args), eval_dataset, data_args, seed=training_args.seed
     )
     dataset_module = get_dataset_module(dataset_dict)
@@ -464,7 +477,7 @@ def make_reorder_get_dataset(reorder_factory):
                     "Use a separate `eval_dataset` instead."
                 )
 
-            dataset_dict = split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
+            dataset_dict = _split_dataset(dataset, eval_dataset, data_args, seed=training_args.seed)
             if data_args.tokenized_path is not None and training_args.should_save:
                 dataset_dict.save_to_disk(data_args.tokenized_path)
                 logger.info_rank0(f"[Dataflex][Reorder] tokenized dataset saved at {data_args.tokenized_path}.")
@@ -599,7 +612,7 @@ def lego_get_dataset(
             "between domain_ids and train_dataset. Use a separate `eval_dataset`."
         )
 
-    dataset_dict = split_dataset(train_dataset, eval_dataset, data_args, seed=training_args.seed)
+    dataset_dict = _split_dataset(train_dataset, eval_dataset, data_args, seed=training_args.seed)
     dataset_module = get_dataset_module(dataset_dict)
 
     plan = list(zip(domain_names, sizes))

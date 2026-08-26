@@ -56,7 +56,7 @@ from transformers.image_processing_utils import BaseImageProcessor
 from transformers.integrations.deepspeed import deepspeed_init, deepspeed_load_checkpoint, is_deepspeed_available
 from transformers.integrations.tpu import tpu_spmd_dataloader
 from transformers.modelcard import TrainingSummary
-from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
+from transformers.modeling_utils import PreTrainedModel, unwrap_model
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
     MODEL_MAPPING_NAMES,
@@ -79,13 +79,11 @@ from transformers.trainer_callback import (
     TrainerState,
 )
 from transformers.trainer_pt_utils import (
-    DistributedTensorGatherer,
     EvalLoopContainer,
     IterableDatasetShard,
     LabelSmoother,
     LayerWiseDummyOptimizer,
     LengthGroupedSampler,
-    SequentialDistributedSampler,
     distributed_broadcast_scalars,
     distributed_concat,
     find_batch_size,
@@ -116,15 +114,12 @@ from transformers.utils import (
     is_galore_torch_available,
     is_grokadamw_available,
     is_in_notebook,
-    is_ipex_available,
     is_liger_kernel_available,
     is_lomo_available,
     is_peft_available,
-    is_safetensors_available,
     is_sagemaker_dp_enabled,
     is_sagemaker_mp_enabled,
     is_schedulefree_available,
-    is_torch_compile_available,
     is_torch_hpu_available,
     is_torch_mlu_available,
     is_torch_mps_available,
@@ -233,10 +228,10 @@ else:
 
 class SelectTrainer(CustomSeq2SeqTrainer):
     def __init__(self, finetuning_args, processor=None, gen_kwargs=None, **kwargs):
-        # 初始化父类
+        # Initialize parent class
         super().__init__(finetuning_args=finetuning_args, processor=processor, gen_kwargs=gen_kwargs, **kwargs)
         name = finetuning_args.component_name
-        # 取该 selector 的 params（可替换 ${output_dir}）
+        # Get the params of the selector (can replace ${output_dir})
         sel_params = load_component(
             'selectors',
             finetuning_args.components_cfg_file,
@@ -244,7 +239,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
             runtime_vars={}
         )
             
-        # 统一提供“动态运行期依赖”，静态类会自动忽略
+        # Provide "dynamic runtime dependencies", static classes will automatically ignore
         runtime = dict(
             dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
@@ -252,7 +247,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
             data_collator=self.data_collator,
         )
 
-        # 实例化（无任何 if/else）
+        # Instantiate (no if/else)
         self.selector = REGISTRY.build("selector", name, runtime=runtime, cfg=sel_params)
         logger.info(f"[SelectTrainer] selector={name}, params={sel_params}")
         logger.info("[Dataflex] SelectTrainer initialized")
@@ -290,8 +285,8 @@ class SelectTrainer(CustomSeq2SeqTrainer):
     @override
     def get_train_dataloader(self, indices: Optional[List[int]] = None) -> DataLoader:
         """
-        返回训练 DataLoader。
-        如果传入 indices，则在 train_dataset 上构造子集 DataLoader。
+        Return the training DataLoader.
+        If indices are passed, construct a subset DataLoader on train_dataset.
         """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
@@ -325,13 +320,13 @@ class SelectTrainer(CustomSeq2SeqTrainer):
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
 
-    # 这个函数也是分别在每个gpu上执行的
+    # Also executed on each GPU
     @override
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
         self.accelerator.free_memory()
-        # 这个batchsize就是per_gpu batchsize!
+        # per_gpu batchsize
         self._train_batch_size = batch_size
         if self.args.auto_find_batch_size:
             if self.state.train_batch_size != self._train_batch_size:
@@ -355,7 +350,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
         # number of training steps per epoch: num_update_steps_per_epoch
         # total number of training steps to execute: max_steps
         # _train_batch_size = micro batch size
-        # 这个是global batch size
+        # global batch size
         total_train_batch_size = self._train_batch_size * args.gradient_accumulation_steps * args.world_size
 
         if total_train_batch_size * self.finetuning_args.update_step > len(self.train_dataset):
@@ -375,11 +370,11 @@ class SelectTrainer(CustomSeq2SeqTrainer):
             train_dataloader = tpu_spmd_dataloader(train_dataloader)
         (
             num_train_epochs,
-            num_update_steps_per_epoch, # 等于len_dataloader // acc (或len(dataset)/worldsize/microbatchsize/acc)
-            num_examples, # 等于数据集长度
-            num_train_samples, # 等于数据集长度 * epoch数
+            num_update_steps_per_epoch, # equals len_dataloader // acc (or len(dataset)/worldsize/microbatchsize/acc)
+            num_examples, # equals dataset length
+            num_train_samples, # equals dataset length * number of epochs
             epoch_based,
-            len_dataloader, # 等于数据集长度/worldsize/micro_batchsize
+            len_dataloader, # equals dataset length/worldsize/micro_batchsize
             max_steps,
         ) = self.set_initial_training_values(args, train_dataloader, total_train_batch_size)
         # Issue #49: support num_train_epochs while keeping dynamic-step training
@@ -404,7 +399,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
         logger.info(f"[Dataflex]Set epoch_based = False")
         num_train_tokens = None
 
-        # 这里是每个gpu的tokens
+        # Here is the tokens of each GPU
         if self.args.include_tokens_per_second:
             num_train_tokens = self.num_tokens(train_dataloader, None if epoch_based else max_steps)
             # If going by epochs, multiply tokens linearly
@@ -621,13 +616,13 @@ class SelectTrainer(CustomSeq2SeqTrainer):
         if remainder == 0:
             remainder = args.gradient_accumulation_steps
         update_step = -1
-        # 一个epoch中的模型总更新次数
+        # Total number of model updates in an epoch
         total_updates = total_training_batches // args.gradient_accumulation_steps + 1
         if args.gradient_accumulation_steps == 1:
             total_updates -= 1
         for _ in range(total_updates):
             update_step += 1
-            # 当前应该拿到的batch数，一般情况是gradient_accumulation_steps，每这么多个batch反向传播一次梯度，每个batch有batch_size个样本
+            # Number of batches to get, usually gradient_accumulation_steps, each time backward propagation once, each batch has batch_size samples
             num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
 
             batch_samples, num_items_in_batch = self.get_batch_samples(current_iterator, num_batches, args.device)
@@ -640,22 +635,25 @@ class SelectTrainer(CustomSeq2SeqTrainer):
                 if len(batch_samples) == 0:
                     self.control.should_training_stop = True
                     break
-            # 遍历当前批次的样本
+            # transformers 4.55's `training_step` divides the loss by this, and only ever
+            # assigns it inside its own `_inner_training_loop` -- the method replaced here.
+            self.current_gradient_accumulation_steps = len(batch_samples)
+            # Iterate over the samples in the current batch
             for i, inputs in enumerate(batch_samples):
-                step += 1  # 每次迭代时增加全局步数
+                step += 1  # Increase global step each time iteration
 
-                # 判断是否达到同步步数，或者是当前epoch的最后一个步数
+                # Check if the synchronization step has been reached, or if it is the last step of the current epoch
                 is_epoch_end = (step + 1 + steps_skipped) % steps_in_epoch == 0
                 do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or is_epoch_end
                 
-                # 由于我们使用了预取（prefetching），我们需要手动设置同步梯度
+                # Since we are using prefetching, we need to manually set sync_gradients
                 self.accelerator.gradient_state._set_sync_gradients(do_sync_step)
 
-                # 如果需要记录输入的token数量
+                # If we need to record the number of input tokens
                 if self.args.include_num_input_tokens_seen:
-                    main_input_name = getattr(self.model, "main_input_name", "input_ids")  # 获取模型的主输入名称（默认为input_ids）
+                    main_input_name = getattr(self.model, "main_input_name", "input_ids")  # Get the main input name of the model (default is input_ids)
                     
-                    # 检查模型的输入是否包含主输入名称
+                    # Check if the input of the model contains the main input name
                     if main_input_name not in inputs:
                         logger.warning(
                             "Tried to track the number of tokens seen, however the current model is "
@@ -663,61 +661,61 @@ class SelectTrainer(CustomSeq2SeqTrainer):
                             "a `main_input_name` attribute to the model class you are using."
                         )
                     else:
-                        # 计算当前输入的tokens数量，并将其加入到已看到的总token数中
-                        input_tokens = inputs[main_input_name].numel()  # 计算当前输入的tokens数量
-                        input_tokens = torch.tensor(input_tokens, device=self.args.device, dtype=torch.int64)  # 转换为张量
-                        self.state.num_input_tokens_seen += self.accelerator.gather(input_tokens).sum().item()  # 累加已看到的token数量
+                        # Calculate the number of tokens in the current input, and add it to the total number of tokens seen
+                        input_tokens = inputs[main_input_name].numel()  # Calculate the number of tokens in the current input
+                        input_tokens = torch.tensor(input_tokens, device=self.args.device, dtype=torch.int64)  # Convert to tensor
+                        self.state.num_input_tokens_seen += self.accelerator.gather(input_tokens).sum().item()  # Add the number of tokens seen
 
-                # 如果需要同步随机数生成器（用于恢复训练）
+                # If we need to synchronize the random number generator (for resuming training)
                 if rng_to_sync:
-                    self._load_rng_state(resume_from_checkpoint)  # 从检查点加载随机数生成器的状态
-                    rng_to_sync = False  # 重置同步标志
+                    self._load_rng_state(resume_from_checkpoint)  # Load the state of the random number generator from the checkpoint
+                    rng_to_sync = False  # Reset the synchronization flag
 
-                # 如果恢复训练且当前epoch还有未训练的步数，跳过已训练的步骤
+                # If resuming training and there are still steps to train in the current epoch, skip the trained steps
                 if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1  # 减少剩余的训练步数
+                    steps_trained_in_current_epoch -= 1  # Decrease the number of remaining training steps
                     if steps_trained_progress_bar is not None:
-                        steps_trained_progress_bar.update(1)  # 更新已训练步数的进度条
+                        steps_trained_progress_bar.update(1)  # Update the progress bar of the trained steps
                     if steps_trained_in_current_epoch == 0:
-                        self._load_rng_state(resume_from_checkpoint)  # 恢复检查点的随机数生成器状态
-                    continue  # 跳过这次迭代，进入下一次迭代
+                        self._load_rng_state(resume_from_checkpoint)  # Load the state of the random number generator from the checkpoint
+                    continue  # Skip this iteration, enter the next iteration
                 elif steps_trained_progress_bar is not None:
-                    steps_trained_progress_bar.close()  # 关闭已训练步数的进度条
-                    steps_trained_progress_bar = None  # 重置进度条
+                    steps_trained_progress_bar.close()  # Close the progress bar of the trained steps
+                    steps_trained_progress_bar = None  # Reset the progress bar
 
-                # 每当步数达到梯度累积步骤数时，执行一次同步操作
+                # Whenever the step reaches the gradient accumulation steps, perform one synchronization operation
                 if step % args.gradient_accumulation_steps == 0:
-                    self.control = self.callback_handler.on_step_begin(args, self.state, self.control)  # 执行步骤开始的回调
+                    self.control = self.callback_handler.on_step_begin(args, self.state, self.control)  # Perform the callback at the beginning of the step
 
-                # 在生成训练时避免依赖`accelerator.accumulate`，显式设置是否同步
+                # When training the generator, avoid depending on `accelerator.accumulate`, explicitly set whether to synchronize
                 context = (
-                    functools.partial(self.accelerator.no_sync, model=model)  # 如果不是最后一个批次，则不进行同步
+                    functools.partial(self.accelerator.no_sync, model=model)  # If not the last batch, then do not synchronize
                     if i != len(batch_samples) - 1
                     and self.accelerator.distributed_type != DistributedType.DEEPSPEED
-                    else contextlib.nullcontext  # 否则不使用同步
+                    else contextlib.nullcontext  # If not the last batch, then do not synchronize
                 )
                 
-                with context():  # 在非同步上下文中进行训练
-                    tr_loss_step = self.training_step(model, inputs, num_items_in_batch)  # 执行一次训练步骤，返回该步的损失值
+                with context():  # Train in the non-synchronized context
+                    tr_loss_step = self.training_step(model, inputs, num_items_in_batch)  # Perform one training step, return the loss value of the step
 
-                # 检查损失是否为NaN或Infinity，如果是，使用之前的损失值替代
+                # Check if the loss is NaN or Infinity, if so, use the previous loss value
                 if (
                     args.logging_nan_inf_filter
                     and not is_torch_xla_available()
                     and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
                 ):
-                    tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)  # 如果损失为NaN或Inf，则使用平均损失
+                    tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)  # If the loss is NaN or Inf, then use the average loss
                 else:
                     if tr_loss.device != tr_loss_step.device:
                         raise ValueError(
                             f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
-                        )  # 检查计算的损失是否在原始设备上
-                    tr_loss = tr_loss + tr_loss_step  # 将当前步的损失加入总损失
+                        )  # Check if the calculated loss is on the original device
+                    tr_loss = tr_loss + tr_loss_step  # Add the loss of the current step to the total loss
 
-                # 累加浮点数操作的数量
+                # Add the number of floating point operations
                 self.current_flos += float(self.floating_point_ops(inputs))
 
-                # step达到acc，同步梯度
+                # When the step reaches the gradient accumulation steps, synchronize the gradients
                 if do_sync_step:
                     # Since we perform prefetching, we need to manually set sync_gradients to True
                     self.accelerator.gradient_state._set_sync_gradients(True)
@@ -764,7 +762,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
                             self.lr_scheduler.step()
 
                     model.zero_grad()
-                    # 同步精度然后反向传播，此时每个gpu上处理了per_gpu_batch_size * acc个数据，global_step+1
+                    # Synchronize the precision and then backward propagation, at this point each GPU has processed per_gpu_batch_size * acc data, global_step+1
                     self.state.global_step += 1
                     self.state.epoch = (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
@@ -817,7 +815,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
                                 int(np.ceil(max(epoch_update_steps - self.finetuning_args.warmup_step, 0) / self.finetuning_args.update_step)),
                             )
                         logger.info(f"[Dataflex] Model training paused, starting the {current_update_times}th dynamic data selection...")
-                        # 这里传一些特定的selector参数
+                        # Here we pass some specific selector parameters
                         extra_args = dict(
                             optimizer_state=self.optimizer.state,
                             scheduler_state=self.lr_scheduler.state_dict(),
@@ -832,7 +830,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
                             **extra_args
                         )
 
-                        # 每个进程根据 local_indices 构造 dataloader
+                        # Each process constructs a dataloader based on local_indices
                         current_dataloader = self.get_train_dataloader(indices=new_indices)
                         current_iterator = iter(current_dataloader)
 
@@ -878,7 +876,7 @@ class SelectTrainer(CustomSeq2SeqTrainer):
                 )
             # if self.control.should_training_stop:
             #     break
-        # 结束主训练循环
+        # End the main training loop
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
             delattr(self, "_past")

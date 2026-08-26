@@ -7,7 +7,7 @@ from typing import List, Dict, Optional
 import torch.distributed as dist
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
-from trak.projectors import BasicProjector, CudaProjector, ProjectionType
+from .less_selector import _trak_projectors
 import os
 import glob 
 
@@ -225,6 +225,9 @@ class NICESelector(Selector):
 
     def _get_trak_projector(self):
         """获取 TRAK projector，优先使用 CUDA 版本。"""
+        # Resolved outside the try, so a missing TRAK is not mistaken for a
+        # missing fast_jl and silently downgraded to an undefined BasicProjector.
+        BasicProjector, CudaProjector, _ = _trak_projectors()
         try:
             import fast_jl
             num_sms = torch.cuda.get_device_properties(self.device.index).multi_processor_count
@@ -428,6 +431,7 @@ class NICESelector(Selector):
         # 1) 初始化 Projector (每个进程都需要一个)
         num_params = self._get_number_of_params(model)
         projector_class = self._get_trak_projector()
+        _, _, ProjectionType = _trak_projectors()
         projector = projector_class(
             grad_dim=num_params,
             proj_dim=self.proj_dim,

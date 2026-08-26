@@ -4,12 +4,21 @@ DataFlex is a data-centric training system built on top of [LLaMA-Factory](https
 
 ## Installation
 
+Requires Python 3.11+. LlamaFactory (0.9.4 - 0.9.6) installs automatically.
+
 ```bash
 git clone https://github.com/OpenDCAI/DataFlex.git
 cd DataFlex
 pip install -e .
-pip install llamafactory==0.9.3
 ```
+
+```bash
+pip install --index-url https://download.pytorch.org/whl/cu124 \
+    torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+The LESS selector needs TRAK: `pip install -e ".[less]"`.
 
 ## CLI Commands
 

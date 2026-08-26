@@ -7,10 +7,26 @@ from typing import List, Dict, Optional
 import torch.distributed as dist
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
-from trak.projectors import BasicProjector, CudaProjector, ProjectionType
 import json
 import os
 import glob # 用于文件查找
+
+
+def _trak_projectors():
+    """TRAK is an optional extra, so import it only when LESS actually runs.
+
+    `selector/__init__.py` imports this module unconditionally, so a top-level
+    import would make TRAK mandatory for every run, including the ones that
+    never select on gradients.
+    """
+    try:
+        from trak.projectors import BasicProjector, CudaProjector, ProjectionType
+    except ImportError as exc:
+        raise ImportError(
+            "The LESS selector needs TRAK. Install it with `pip install dataflex[less]`."
+        ) from exc
+
+    return BasicProjector, CudaProjector, ProjectionType
 
 # NEW: IndexedDataset Wrapper
 class IndexedDataset(Dataset):
@@ -142,6 +158,9 @@ class LessSelector(Selector):
 
     def _get_trak_projector(self):
         """获取 TRAK projector，优先使用 CUDA 版本。"""
+        # Resolved outside the try, so a missing TRAK is not mistaken for a
+        # missing fast_jl and silently downgraded to an undefined BasicProjector.
+        BasicProjector, CudaProjector, _ = _trak_projectors()
         try:
             import fast_jl
             num_sms = torch.cuda.get_device_properties(self.device.index).multi_processor_count
@@ -183,6 +202,7 @@ class LessSelector(Selector):
         # 1) 初始化 Projector (每个进程都需要一个)
         num_params = self._get_number_of_params(model)
         projector_class = self._get_trak_projector()
+        _, _, ProjectionType = _trak_projectors()
         projector = projector_class(
             grad_dim=num_params,
             proj_dim=self.proj_dim,

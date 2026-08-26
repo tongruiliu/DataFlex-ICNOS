@@ -95,13 +95,17 @@ pip install dataflex
 git clone https://github.com/OpenDCAI/DataFlex.git
 cd DataFlex
 pip install -e .
-
-# 在 Python 3.10 环境中，请安装 v0.9.3 以确保兼容性
-pip install llamafactory==0.9.3
-
-# 在 Python 3.11+ 环境中，推荐安装最新的 v0.9.4
-pip install llamafactory==0.9.4
 ```
+
+> **说明：** 需要 Python 3.11+，兼容 LlamaFactory 0.9.4 - 0.9.6，它会随核心依赖一起自动安装。
+
+> ```bash
+> pip install --index-url https://download.pytorch.org/whl/cu124 \
+>     torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+> python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+> ```
+>
+> LESS selector 需要 TRAK，它是可选依赖：`pip install dataflex[less]`。
 
 启动命令与 [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory) 类似。
 下面给出一个使用 [LESS](https://arxiv.org/abs/2402.04333) 的示例：

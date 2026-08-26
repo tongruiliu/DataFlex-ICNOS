@@ -99,7 +99,15 @@ cd DataFlex
 pip install -e .
 ```
 
-> **Note:** Python 3.11+ is recommended. The core dependencies (including `llamafactory`) will be installed automatically. If you are using Python 3.10, you need to install a compatible version of `llamafactory` manually.
+> **Note:** Requires Python 3.11+ and works with LlamaFactory 0.9.4 - 0.9.6, which is installed automatically along with the other core dependencies.
+
+> ```bash
+> pip install --index-url https://download.pytorch.org/whl/cu124 \
+>     torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+> python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+> ```
+>
+> The LESS selector needs TRAK, which is an optional extra: `pip install dataflex[less]`.
 
 The launch command is similar to [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory).
 Below is an example using [LESS](https://arxiv.org/abs/2402.04333) :
