@@ -1,16 +1,14 @@
 torch>=2.4.0,<=2.10.0
 torchvision>=0.19.0,<=0.21.0
 torchaudio>=2.4.0,<=2.6.0
-# The window both LlamaFactory 0.9.4 and 0.9.6 accept: 0.9.4 caps transformers at
-# 4.57.1, 0.9.6 floors it at 4.55.0 and excludes 4.57.0.
-transformers>=4.55.0,<=4.57.1,!=4.57.0
+# Same window LlamaFactory 0.9.5 accepts, spanning transformers v4 and v5.
+# Qwen3.5 and Gemma 4 need >=5.5.0; the rest works across the whole range.
+transformers>=4.55.0,!=4.57.0,<=5.6.0
 accelerate>=1.3.0,<1.12.0
 tyro==0.8.14
-numpy>=1.24.0,<2.0.0
-peft>=0.15.2
+# Uncapped: the v5 stack resolves to numpy 2.x.
+numpy>=1.24.0
 datasets>=2.16.0,<=4.0.0
-tokenizers>=0.21.0
-gradio>=4.38.0,<=5.12.0
 pandas>=2.0.0,<3.0.0
 scipy
 einops
@@ -28,4 +26,4 @@ pyyaml
 av
 librosa
 omegaconf
-llamafactory>=0.9.4
+llamafactory>=0.9.5

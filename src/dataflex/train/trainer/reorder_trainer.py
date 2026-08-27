@@ -4,10 +4,10 @@ import torch
 from typing_extensions import override
 
 from dataflex.core.registry import REGISTRY
+from dataflex.train.hooks import group_by_length_requested
+from dataflex.train.reorder import resolve_reorder_kind  # also registers the reorders
 from dataflex.utils.load_component import load_component
 from dataflex.utils.logging import logger
-
-from dataflex.train.reorder import resolve_reorder_kind  # also registers the reorders
 
 from .select_trainer import SelectTrainer
 
@@ -101,10 +101,10 @@ class ReorderTrainer(SelectTrainer):
         if train_dataset is None:
             return None
 
-        if self.args.group_by_length:
+        if group_by_length_requested(self.args):
             logger.warning(
-                "[Dataflex][Reorder] `group_by_length` reorders batches by length and would override the "
-                "curriculum; ignoring it."
+                "[Dataflex][Reorder] length-grouped batching reorders batches by length and would "
+                "override the curriculum; ignoring it."
             )
         if not self.finetuning_args.disable_shuffling:
             logger.info("[Dataflex][Reorder] forcing SequentialSampler so the ordering survives.")

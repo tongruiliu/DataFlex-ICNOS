@@ -97,7 +97,7 @@ cd DataFlex
 pip install -e .
 ```
 
-> **说明：** 需要 Python 3.11+，兼容 LlamaFactory 0.9.4 - 0.9.6，它会随核心依赖一起自动安装。
+> **说明：** 需要 Python 3.11+ 与 LlamaFactory 0.9.5+，它们会随核心依赖一起自动安装。transformers 4.55 到 5.6 均可运行；较新的模型（Qwen3.5、Gemma 4）需要 transformers 5.5+。
 
 > ```bash
 > pip install --index-url https://download.pytorch.org/whl/cu124 \

@@ -6,30 +6,30 @@ import torch
 
 class Weighter(ABC):
     """
-    数据加权器的抽象基类，定义了加权器的基本接口和公共功能。
+    Abstract base class for data weighting, defining the basic interface and common functionality.
     """
     
     def __init__(self, **kwargs):
         """
-        基类构造函数
+        Base class constructor
         
         Args:
-            **kwargs: 子类特定的参数
+            **kwargs: Subclass-specific parameters
         """
-        # 子类可以在这里定义公共的初始化逻辑
+        # Subclasses can define common initialization logic here
         pass
     
     def _per_sample_loss_from_logits(self, logits, labels, ignore_index: int = -100):
         """
-        从 logits 和 labels 计算每个样本的损失
+        Calculate the per-sample loss from logits and labels
         
         Args:
-            logits: 模型输出的 logits
-            labels: 真实标签
-            ignore_index: 忽略的标签索引
+            logits: Model output logits
+            labels: True labels
+            ignore_index: Ignored label index
             
         Returns:
-            torch.Tensor: 每个样本的损失 (B,)
+            torch.Tensor: The per-sample loss (B,)
         """
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
@@ -51,32 +51,32 @@ class Weighter(ABC):
         inputs: dict[str, Union[torch.Tensor, Any]] | None = None,
     ) -> torch.Tensor:
         """
-        核心加权方法，子类必须实现此方法
+        Core weighting method, subclasses must implement this method
         
         Args:
-            losses: 本卡的 per-sample loss (B,)
-            ctx: Trainer 上下文，可获取 global_step 等信息
-            model: 当前模型
-            inputs: 输入数据
+            losses: Per-sample loss on this card (B,)
+            ctx: Trainer context, can get global_step information
+            model: Current model
+            inputs: Input data
             
         Returns:
-            torch.Tensor: 加权后的总损失（标量）
+            torch.Tensor: The weighted total loss (scalar)
         """
         pass
     
     def training_step(self, ctx, model, inputs, num_items_in_batch=None, use_weighter=False):
         """
-        执行训练步骤，包含前向传播、损失计算、加权和反向传播
+        Execute the training step, including forward propagation, loss calculation, weighting, and backpropagation
         
         Args:
-            ctx: Trainer 上下文
-            model: 模型
-            inputs: 输入数据
-            num_items_in_batch: 批次中的样本数量
-            use_weighter: 是否使用加权器
+            ctx: Trainer context
+            model: Model
+            inputs: Input data
+            num_items_in_batch: Number of samples in the batch
+            use_weighter: Whether to use the weighter
             
         Returns:
-            本步骤的损失值
+            The loss value for this step
         """
         from dataflex.utils.logging import logger
         from transformers.utils import is_apex_available
@@ -88,21 +88,26 @@ class Weighter(ABC):
 
         inputs = ctx._prepare_inputs(inputs)
 
-        # 预先保存一份 labels（防止某些实现里被 pop 掉）
+        # Save a copy of labels (to prevent them from being popped in some implementations)
         labels_for_weighter = inputs.get("labels", None)
 
         with ctx.compute_loss_context_manager():
-            # 关键：拿到 outputs
+            # Key: get the outputs
             loss, outputs = ctx.compute_loss(
                 model, inputs, num_items_in_batch=num_items_in_batch, return_outputs=True
             )
 
+        # Whether the model's scalar loss really got replaced by our own per-sample one.
+        # If it did, the model's per-token normalization no longer applies and this
+        # method has to do the gradient accumulation scaling itself.
+        reweighted = False
+
         if use_weighter:
-            # 1) 如果 compute_loss 已经返回的是 (B,) 向量，直接用
+            # 1) If compute_loss already returned a (B,) vector, use it directly
             if torch.is_tensor(loss) and loss.dim() == 1:
                 per_sample = loss
             else:
-                # 2) 否则用 logits+labels 现场算每样本 loss（不需要二次前向）
+                # 2) Otherwise, calculate the per-sample loss from logits and labels (no need for second forward pass)
                 logits = getattr(outputs, "logits", None) if outputs is not None else None
                 labels = inputs.get("labels", None)
                 if labels is None:
@@ -112,12 +117,13 @@ class Weighter(ABC):
                     per_sample = self._per_sample_loss_from_logits(logits, labels)
 
             if per_sample is not None:
-                # 日志仅主进程打
+                # Log only from the main process
                 if ctx.args.local_rank in [-1, 0]:
                     ps = per_sample.detach().float().cpu().view(-1)[0]
                     logger.info(f"[Dataflex] Before weighting per-sample (first sample): {ps}")
-                # 分布式加权
+                # Distributed weighting
                 loss = self.get_weighted_loss(per_sample, ctx=ctx, model=model, inputs=inputs)
+                reweighted = True
                 if ctx.args.local_rank in [-1, 0]:
                     logger.info(f"[Dataflex] After weighting (first sample): {float(loss.detach().cpu())}")
             else:
@@ -139,7 +145,23 @@ class Weighter(ABC):
                 with amp.scale_loss(loss, ctx.optimizer) as scaled_loss:
                     scaled_loss.backward()
         else:
-            loss = loss / ctx.args.gradient_accumulation_steps
+            # Gradient accumulation scaling, aligned with upstream Trainer.training_step.
+            #
+            # Upstream's rule: skip the division when the model already normalized by
+            # num_items_in_batch, otherwise divide by the group's *actual* micro-batch
+            # count. This used to divide unconditionally, and by the static
+            # args.gradient_accumulation_steps, so an already-normalized loss got
+            # divided twice and a short final group got divided too much.
+            #
+            # Reweighting is a third case: the per-sample loss is recomputed here from
+            # logits, so the model's normalization does not apply and we must scale.
+            if reweighted or (
+                (not getattr(ctx, "model_accepts_loss_kwargs", False) or num_items_in_batch is None)
+                and getattr(ctx, "compute_loss_func", None) is None
+            ):
+                loss = loss / getattr(
+                    ctx, "current_gradient_accumulation_steps", ctx.args.gradient_accumulation_steps
+                )
             if ctx.accelerator.distributed_type == DistributedType.DEEPSPEED:
                 kwargs["scale_wrt_gas"] = False
             ctx.accelerator.backward(loss, **kwargs)

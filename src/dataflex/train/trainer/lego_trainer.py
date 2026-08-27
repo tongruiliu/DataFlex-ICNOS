@@ -4,7 +4,8 @@ import numpy as np
 import torch
 from typing_extensions import override
 
-from dataflex.train.lego import PlanContext, ScoreBoard, SchedulePipeline
+from dataflex.train.hooks import group_by_length_requested
+from dataflex.train.lego import PlanContext, SchedulePipeline, ScoreBoard
 from dataflex.train.lego.domain_view import DomainView
 from dataflex.utils.load_component import load_component
 from dataflex.utils.logging import logger
@@ -174,10 +175,10 @@ class LegoTrainer(SelectTrainer):
             return None
 
         if self.pipeline.has_reorder:
-            if self.args.group_by_length:
+            if group_by_length_requested(self.args):
                 logger.warning(
-                    "[Dataflex][Lego] `group_by_length` would reorder batches by length and override "
-                    "the curriculum; ignoring it."
+                    "[Dataflex][Lego] length-grouped batching would reorder batches by length and "
+                    "override the curriculum; ignoring it."
                 )
             return torch.utils.data.SequentialSampler(train_dataset)
 

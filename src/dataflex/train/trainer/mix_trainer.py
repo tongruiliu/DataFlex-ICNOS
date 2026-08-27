@@ -1,8 +1,5 @@
 # Copyright 2025 HuggingFace Inc. and the LlamaFactory team.
 #
-# This code is inspired by the HuggingFace's transformers library.
-# https://github.com/huggingface/transformers/blob/v4.40.0/src/transformers/trainer_seq2seq.py
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -15,233 +12,53 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
-import copy
+"""Dynamic mixture: a component re-decides the per-domain sampling proportions.
+
+Unlike selection, which narrows the dataset to a set of indices, mixing rebuilds
+the dataset from its per-domain sources -- hence `WHOLE_DATASET` rather than an
+index list. Two components need more than the proportions: DoReMi weights the loss
+per domain (`compute_loss`), and ODM attributes a bandit reward per batch
+(`training_step`).
+"""
+
 import functools
-import glob
-import importlib.metadata
-import os
-import random
-import re
-import shutil
-import numpy as np
-from torch import nn
-import time
-import torch.distributed as dist
-from collections.abc import Mapping
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional, Union, List
-from torch.utils.data import Subset, DataLoader, IterableDataset
-import os
-from types import MethodType
-from typing import TYPE_CHECKING, Any, Optional, Union
-from packaging import version
-import numpy as np
+from typing import Any, List, Optional
+
 import torch
-from typing_extensions import override
-from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler
-from llamafactory.extras.constants import IGNORE_INDEX
-from llamafactory.extras.packages import is_transformers_version_greater_than
-from llamafactory.train.callbacks import SaveProcessorCallback
-from llamafactory.train.trainer_utils import create_custom_optimizer, create_custom_scheduler
 from llamafactory.train.sft.trainer import CustomSeq2SeqTrainer
+from torch.utils.data import DataLoader, RandomSampler
+from transformers.trainer_pt_utils import LengthGroupedSampler
+from transformers.trainer_utils import has_length, seed_worker
+from transformers.utils import is_datasets_available
+from typing_extensions import override
 
-from transformers.configuration_utils import PretrainedConfig
-from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
-from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
-from transformers.feature_extraction_sequence_utils import SequenceFeatureExtractor
-from transformers.feature_extraction_utils import FeatureExtractionMixin
-from transformers.hyperparameter_search import ALL_HYPERPARAMETER_SEARCH_BACKENDS, default_hp_search_backend
-from transformers.image_processing_utils import BaseImageProcessor
-from transformers.integrations.deepspeed import deepspeed_init, deepspeed_load_checkpoint, is_deepspeed_available
-from transformers.integrations.tpu import tpu_spmd_dataloader
-from transformers.modelcard import TrainingSummary
-from transformers.modeling_utils import PreTrainedModel, unwrap_model
-from transformers.models.auto.modeling_auto import (
-    MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
-    MODEL_MAPPING_NAMES,
-)
-from transformers.optimization import Adafactor, get_scheduler
-from transformers.processing_utils import ProcessorMixin
-from transformers.pytorch_utils import (
-    ALL_LAYERNORM_LAYERS,
-    is_torch_greater_or_equal_than_2_3,
-)
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.trainer_callback import (
-    CallbackHandler,
-    DefaultFlowCallback,
-    ExportableState,
-    PrinterCallback,
-    ProgressCallback,
-    TrainerCallback,
-    TrainerControl,
-    TrainerState,
-)
-from transformers.trainer_pt_utils import (
-    EvalLoopContainer,
-    IterableDatasetShard,
-    LabelSmoother,
-    LayerWiseDummyOptimizer,
-    LengthGroupedSampler,
-    distributed_broadcast_scalars,
-    distributed_concat,
-    find_batch_size,
-    get_model_param_count,
-    get_module_class_from_name,
-    get_parameter_names,
-    nested_concat,
-    nested_detach,
-    nested_numpify,
-    nested_xla_mesh_reduce,
-    reissue_pt_warnings,
-    remove_dummy_checkpoint,
-    set_rng_state_for_device,
-)
-from transformers.trainer_utils import (
-    TrainOutput,
-    speed_metrics,
-    seed_worker,
-    has_length
-)
-from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
-from transformers.utils import (
-    is_accelerate_available,
-    is_apex_available,
-    is_apollo_torch_available,
-    is_bitsandbytes_available,
-    is_datasets_available,
-    is_galore_torch_available,
-    is_grokadamw_available,
-    is_in_notebook,
-    is_liger_kernel_available,
-    is_lomo_available,
-    is_peft_available,
-    is_sagemaker_dp_enabled,
-    is_sagemaker_mp_enabled,
-    is_schedulefree_available,
-    is_torch_hpu_available,
-    is_torch_mlu_available,
-    is_torch_mps_available,
-    is_torch_musa_available,
-    is_torch_neuroncore_available,
-    is_torch_npu_available,
-    is_torch_xla_available,
-    is_torch_xpu_available,
-    is_torchao_available,
-    strtobool,
-)
-
-from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.quantization_config import QuantizationMethod
-
-from dataflex.utils.load_component import load_component
+# Registers the built-in mixers into REGISTRY as a side effect.
+import dataflex.train.mixer  # noqa: F401
 from dataflex.core.registry import REGISTRY
-import dataflex.train.mixer
-
-TRAINING_ARGS_NAME = "training_args.bin"
-TRAINER_STATE_NAME = "trainer_state.json"
-OPTIMIZER_NAME = "optimizer.pt"
-SCALER_NAME = "scaler.pt"
-OPTIMIZER_NAME_BIN = "optimizer.bin"
-SCHEDULER_NAME = "scheduler.pt"
-FSDP_MODEL_NAME = "pytorch_model_fsdp"
-
-
-if TYPE_CHECKING:
-    from torch.utils.data import Dataset
-    from transformers import PreTrainedTokenizer, ProcessorMixin
-    from transformers.trainer import PredictionOutput
-
-    from llamafactory.hparams import FinetuningArguments
-
+from dataflex.train.hooks import WHOLE_DATASET, DataflexTrainerMixin, group_by_length_requested
+from dataflex.utils.load_component import load_component
 from dataflex.utils.logging import logger
 
-if is_peft_available():
-    from peft import PeftModel
-
-def _is_peft_model(model):
-    if is_peft_available():
-        classes_to_check = (PeftModel,) if is_peft_available() else ()
-        # Here we also check if the model is an instance of `PeftMixedModel` introduced in peft>=0.7.0: https://github.com/huggingface/transformers/pull/28321
-        if version.parse(importlib.metadata.version("peft")) >= version.parse("0.7.0"):
-            from peft import PeftMixedModel
-
-            classes_to_check = (*classes_to_check, PeftMixedModel)
-        return isinstance(model, classes_to_check)
-    return False
-
-if is_sagemaker_mp_enabled():
-    # import smdistributed.modelparallel.torch as smp
-    # from smdistributed.modelparallel import __version__ as SMP_VERSION
-
-    # IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
-
-    # from .trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
-    pass
-else:
-    IS_SAGEMAKER_MP_POST_1_10 = False
-
-if is_accelerate_available():
-    from accelerate import Accelerator, skip_first_batches
-    from accelerate import __version__ as accelerate_version
-    from accelerate.state import AcceleratorState
-    from accelerate.utils import (
-        AutocastKwargs,
-        DistributedDataParallelKwargs,
-        DistributedType,
-        load_fsdp_model,
-        load_fsdp_optimizer,
-        save_fsdp_model,
-        save_fsdp_optimizer,
-    )
-
-    DATA_SAMPLERS = [RandomSampler]
-    if version.parse(accelerate_version) > version.parse("1.3.0"):
-        from accelerate.utils import TorchTensorParallelPlugin
-    if version.parse(accelerate_version) > version.parse("0.23.0"):
-        from accelerate.data_loader import SeedableRandomSampler
-
-        DATA_SAMPLERS += [SeedableRandomSampler]
-
-    if is_deepspeed_available():
-        from accelerate.utils import DeepSpeedSchedulerWrapper
-
-if is_apex_available():
-    from apex import amp
 
 if is_datasets_available():
     import datasets
 
-if is_torch_xla_available():
-    # import torch_xla.core.xla_model as xm
-    # import torch_xla.debug.metrics as met
-    # from torch_xla import __version__ as XLA_VERSION
 
-    # IS_XLA_FSDPV2_POST_2_2 = version.parse(XLA_VERSION) >= version.parse(XLA_FSDPV2_MIN_VERSION)
-    # if IS_XLA_FSDPV2_POST_2_2:
-    #     import torch_xla.distributed.spmd as xs
-    #     import torch_xla.runtime as xr
-    pass
-else:
-    IS_XLA_FSDPV2_POST_2_2 = False
-
-
-class MixTrainer(CustomSeq2SeqTrainer):
+class MixTrainer(DataflexTrainerMixin, CustomSeq2SeqTrainer):
     def __init__(self, finetuning_args, processor=None, gen_kwargs=None, model_args=None, **kwargs):
-        # Initialize parent class
         self.mixture_manager = kwargs.pop("mixture_manager", None)
-        
-        # Compatible with PT stage initialization parameters
+        self.mixer = None
+        self._last_batch = None
+
+        # The pt stage passes `model_args`, the sft stage passes `gen_kwargs`.
         if gen_kwargs is None and model_args is not None:
-            # PT stage initialization
             super().__init__(finetuning_args=finetuning_args, processor=processor, model_args=model_args, **kwargs)
         else:
-            # SFT stage initialization
             super().__init__(finetuning_args=finetuning_args, processor=processor, gen_kwargs=gen_kwargs, **kwargs)
-        if self.finetuning_args.static_mix == False and self.mixture_manager is not None:
+
+        if not self.finetuning_args.static_mix and self.mixture_manager is not None:
             name = finetuning_args.component_name
-            # Get the params of the mixer (can replace ${output_dir})
+            # Params of the mixer (can substitute ${output_dir})
             sel_params = load_component(
                 'mixers',
                 finetuning_args.components_cfg_file,
@@ -249,26 +66,21 @@ class MixTrainer(CustomSeq2SeqTrainer):
                 runtime_vars={}
             )
             sel_params["mixture_manager"] = self.mixture_manager
-            # Provide "dynamic runtime dependencies", static classes will automatically ignore
             runtime = dict(
                 dataset=self.train_dataset,
                 eval_dataset=self.eval_dataset,
                 accelerator=self.accelerator,
                 data_collator=self.data_collator,
-                output_dir=self.args.output_dir,  # Pass output_dir for weight logging
+                output_dir=self.args.output_dir,  # for weight logging
             )
-
-            # Instantiate (no if/else)
             self.mixer = REGISTRY.build("mixer", name, runtime=runtime, cfg=sel_params)
             logger.info(f"[Dataflex] mixer={name}, params={sel_params}")
         elif self.mixture_manager is not None:
-            logger.info(f"[Dataflex] Using static mix proportions during training.")
+            logger.info("[Dataflex] Using static mix proportions during training.")
         else:
-            logger.info(f"[Dataflex] No mixture manager available, using standard training.")
-        logger.info("[Dataflex] MixTrainer initialized")
-    
-        #########################################################
-        # SFT Data Mixer: Dynamic MoE (Mixture of Experts)
+            logger.info("[Dataflex] No mixture manager available, using standard training.")
+
+        # SFT data mixer: dynamic MoE
         if getattr(finetuning_args, 'freeze_gate', False):
             frozen_count = 0
             for name_p, param in self.model.named_parameters():
@@ -278,112 +90,227 @@ class MixTrainer(CustomSeq2SeqTrainer):
             logger.info(f"[Dataflex] Froze {frozen_count} gate parameters (freeze_gate=True)")
 
         logger.info("[Dataflex] MixTrainer initialized")
-        #########################################################
+
+    # ------------------------------------------------------------------
+    # Schedule
+    # ------------------------------------------------------------------
+
+    @property
+    def _total_train_batch_size(self) -> int:
+        return self.get_total_train_batch_size(self.args)
+
+    def _steps_for_one_pass(self) -> int:
+        """Optimizer steps to cover the combined source datasets once."""
+        source_size = sum(len(d) for d in self.mixture_manager.sources.values())
+        steps_per_epoch = max(1, source_size // self._total_train_batch_size)
+        return int(steps_per_epoch * self.args.num_train_epochs)
+
+    def _ensure_initial_snapshot(self) -> None:
+        """Draw the opening snapshot if it has not been drawn yet.
+
+        `loader.py` hands this trainer a `None` train_dataset on purpose: the
+        first snapshot's size depends on the total batch size, which is not known
+        until `train()` has resolved `_train_batch_size`. So the draw happens on
+        the first dataloader request rather than in `__init__`.
+        """
+        if self.train_dataset is not None or self.mixture_manager is None:
+            return
+
+        self.print_mixture_info()
+        fa = self.finetuning_args
+        if fa.static_mix:
+            logger.info("[Dataflex] Initial static mix data with initial mixture proportions.")
+            steps = fa.train_step if fa.train_step > 0 else self._steps_for_one_pass()
+        else:
+            logger.info("[Dataflex] Initial warmup data with initial mixture proportions.")
+            steps = fa.warmup_step
+        self.train_dataset = self.mixture_manager.rebuild(
+            num_samples=self._total_train_batch_size * steps
+        )
+
+    @override
+    def dataflex_step_budget(self) -> Optional[int]:
+        fa = self.finetuning_args
+        if self.mixture_manager is None:
+            return None
+
+        if fa.train_step > 0:
+            return fa.train_step
+
+        # update_times < 0 means "keep re-mixing until training ends".
+        if fa.static_mix or fa.update_times < 0:
+            return self._steps_for_one_pass()
+
+        return fa.warmup_step + fa.update_step * fa.update_times
+
+    @override
+    def dataflex_next_indices(self, model, step_id: int) -> Optional[Any]:
+        fa = self.finetuning_args
+        if fa.static_mix or self.mixer is None or step_id == 0:
+            return None
+        if step_id >= self.state.max_steps:
+            return None
+
+        at_boundary = step_id == fa.warmup_step or (
+            step_id > fa.warmup_step and (step_id - fa.warmup_step) % fa.update_step == 0
+        )
+        if not at_boundary:
+            return None
+
+        self.accelerator.wait_for_everyone()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        update_times = (step_id - fa.warmup_step) // fa.update_step + 1
+        logger.info(f"[Dataflex] Model training paused, starting the {update_times}th dynamic data mixture...")
+
+        # DoReMi compares per-token losses on a real batch, so the mixer needs one.
+        # A planning boundary has no batch of its own; the last one trained on is
+        # the closest thing, and it is what the vendored loop passed too.
+        batch = self._last_batch
+        probs = self.mixer.mix(
+            model=model,
+            step_id=step_id,
+            batch=batch,
+            # A collated batch is a BatchEncoding, i.e. a UserDict -- `isinstance(_, dict)`
+            # is False for it and would silently drop the domain ids.
+            domain_ids=batch.get('domain_id') if hasattr(batch, 'get') else None,
+            data_collator=self.data_collator,
+            dataset=self.train_dataset,
+        )
+
+        self.mixture_manager.set_proportions(probs)
+        self.train_dataset = self.mixture_manager.rebuild(
+            num_samples=self._total_train_batch_size * fa.update_step
+        )
+        if self.accelerator.is_main_process:
+            logger.info(
+                f"[Dataflex] Updated dataloader at step {step_id}, new mixture proportions generated."
+            )
+            self.print_mixture_info()
+        return WHOLE_DATASET
+
+    # ------------------------------------------------------------------
+    # Loss space
+    # ------------------------------------------------------------------
+
+    @override
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+        # Remember the batch for the next planning boundary.
+        self._last_batch = inputs
+
+        # ODM attributes its bandit reward per batch, which needs the loss and the
+        # batch's domain together -- a pairing only `training_step` sees.
+        if (
+            not self.finetuning_args.static_mix
+            and self.mixer is not None
+            and hasattr(self.mixer, 'update_batch_info')
+        ):
+            domain_id = inputs.get('domain_id') if hasattr(inputs, 'get') else None
+            if torch.is_tensor(domain_id):
+                domain_id = int(domain_id.view(-1)[0].item()) if domain_id.numel() else None
+            if domain_id is not None:
+                self.mixer.update_batch_info(float(loss.detach().float().cpu()), domain_id)
+
+        return loss
 
     @override
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """
-        Override compute_loss to support DoReMi loss reweighting.
-        For DoReMi mixer, apply domain weights α_t to weight losses by domain.
-        """
-        # Check if this is DoReMi mixer that requires loss reweighting
+        """DoReMi weights the loss by the sample's domain; other mixers do not."""
         is_doremi = (
-            hasattr(self, 'mixer') and 
-            self.mixer is not None and 
-            hasattr(self.mixer, 'get_current_doremi_weights') and
-            self.finetuning_args.static_mix == False
+            self.mixer is not None
+            and hasattr(self.mixer, 'get_current_doremi_weights')
+            and not self.finetuning_args.static_mix
         )
-        
         if not is_doremi:
-            # For non-DoReMi mixers, use standard loss computation
-            return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
-        
-        # DoReMi: Apply domain weight reweighting to losses
-        # Get domain_id from inputs
+            return super().compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+
         domain_ids = inputs.get('domain_id')
         if domain_ids is None:
-            # Fallback to standard loss if no domain_id available
             logger.warning("[DoremiMixer] No domain_id in batch, using standard loss computation")
-            return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
-        
-        # Get current domain weights α_t
+            return super().compute_loss(
+                model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            )
+
         domain_weights = self.mixer.get_current_doremi_weights()
-        
-        # Compute standard forward pass
-        if self.label_smoother is not None and "labels" in inputs:
-            labels = inputs.pop("labels")
-        else:
-            labels = None
-        
+
+        labels = inputs.pop("labels") if (self.label_smoother is not None and "labels" in inputs) else None
         outputs = model(**inputs)
-        
-        # Compute per-sample losses
-        if labels is not None:
-            if hasattr(outputs, "loss") and outputs.loss is not None:
-                # Some models return loss directly, but we need per-sample loss
-                # Recompute with reduction='none'
-                logits = outputs.logits
-                if self.label_smoother is not None:
-                    loss = self.label_smoother(outputs, labels, shift_labels=True)
-                else:
-                    # Compute per-token loss
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    vocab_size = shift_logits.size(-1)
-                    loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
-                    per_token_loss = loss_fct(shift_logits.view(-1, vocab_size), shift_labels.view(-1))
-                    per_token_loss = per_token_loss.view(shift_labels.size())
-                    
-                    # Compute per-sample loss (average over tokens)
-                    valid_mask = (shift_labels != -100)
-                    per_sample_loss = (per_token_loss * valid_mask.float()).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
-            else:
-                if isinstance(outputs, dict) and "loss" not in outputs:
-                    raise ValueError(
-                        "The model did not return a loss from the inputs, only the following keys: "
-                        f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
-                    )
-                loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-                # If loss is scalar, we can't apply per-sample weighting
-                # This shouldn't happen in DoReMi training
-                logger.warning("[DoremiMixer] Model returned scalar loss, cannot apply per-sample reweighting")
-                return (loss, outputs) if return_outputs else loss
-        else:
-            if isinstance(outputs, dict):
-                loss = outputs["loss"] if "loss" in outputs else outputs["logits"]
-            else:
-                loss = outputs[0]
+
+        if labels is None:
+            loss = outputs["loss"] if isinstance(outputs, dict) and "loss" in outputs else outputs[0]
             return (loss, outputs) if return_outputs else loss
-        
-        # Apply domain weights to per-sample losses
-        # domain_ids shape: (batch_size,)
-        # per_sample_loss shape: (batch_size,)
-        # domain_weights shape: (num_domains,)
-        device = per_sample_loss.device
-        domain_weights_tensor = torch.tensor(domain_weights, dtype=per_sample_loss.dtype, device=device)
-        
-        # Get weight for each sample based on its domain_id
-        sample_weights = domain_weights_tensor[domain_ids]  # shape: (batch_size,)
-        
-        # Apply weights and compute final loss
+
+        logits = getattr(outputs, "logits", None)
+        if logits is None:
+            # Nothing to reduce per sample; report the model's own loss unweighted.
+            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            logger.warning("[DoremiMixer] Model returned scalar loss, cannot apply per-sample reweighting")
+            return (loss, outputs) if return_outputs else loss
+
+        if self.label_smoother is not None:
+            per_sample_loss = self.label_smoother(outputs, labels, shift_labels=True)
+        else:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+            per_token_loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            ).view(shift_labels.size())
+            valid_mask = (shift_labels != -100)
+            per_sample_loss = (
+                (per_token_loss * valid_mask.float()).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+            )
+
+        domain_weights_tensor = torch.tensor(
+            domain_weights, dtype=per_sample_loss.dtype, device=per_sample_loss.device
+        )
+        sample_weights = domain_weights_tensor[domain_ids]
         weighted_loss = (per_sample_loss * sample_weights).mean()
-        
-        if self.accelerator.is_main_process and torch.rand(1).item() < 0.01:  # Log 1% of the time
-            logger.info(f"[DoremiMixer] Loss reweighting - domain_weights: {domain_weights}, "
-                       f"sample mean loss: {per_sample_loss.mean().item():.4f}, "
-                       f"weighted loss: {weighted_loss.item():.4f}")
-        
+
+        if self.accelerator.is_main_process and torch.rand(1).item() < 0.01:  # ~1% of steps
+            logger.info(
+                f"[DoremiMixer] Loss reweighting - domain_weights: {domain_weights}, "
+                f"sample mean loss: {per_sample_loss.mean().item():.4f}, "
+                f"weighted loss: {weighted_loss.item():.4f}"
+            )
+
         return (weighted_loss, outputs) if return_outputs else weighted_loss
 
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
+
     @override
-    def _get_train_sampler(self, train_dataset) -> Optional[torch.utils.data.Sampler]:
+    def train(self, *args, **kwargs):
+        out = super().train(*args, **kwargs)
+        if self.mixer is not None and hasattr(self.mixer, 'save_average_weights'):
+            if self.accelerator.is_main_process:
+                logger.info("[Dataflex] Saving DoReMi average weights for Step 2...")
+                self.mixer.save_average_weights(self.args.output_dir)
+                logger.info("[Dataflex] DoReMi Step 2 complete. Use the saved average weights for Step 2.")
+        return out
+
+    # ------------------------------------------------------------------
+    # Data loading
+    # ------------------------------------------------------------------
+
+    @override
+    def _get_train_sampler(self, train_dataset=None) -> Optional[torch.utils.data.Sampler]:
+        if train_dataset is None:
+            train_dataset = self.train_dataset
         if self.finetuning_args.disable_shuffling:
             return torch.utils.data.SequentialSampler(train_dataset)
         if train_dataset is None or not has_length(train_dataset):
             return None
 
-        # Build the sampler.
-        if self.args.group_by_length:
+        if group_by_length_requested(self.args):
             if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
                 lengths = (
                     train_dataset[self.args.length_column_name]
@@ -402,27 +329,26 @@ class MixTrainer(CustomSeq2SeqTrainer):
                 model_input_name=model_input_name,
             )
 
-        else:
-            return RandomSampler(train_dataset)
+        return RandomSampler(train_dataset)
 
     @override
-    def get_train_dataloader(self) -> DataLoader:
-        """
-        Return the training DataLoader.
-        If indices are passed, construct a subset DataLoader on train_dataset.
-        """
+    def get_train_dataloader(self, indices: Optional[List[int]] = None) -> DataLoader:
+        """Training DataLoader over the current mixture snapshot."""
+        self._ensure_initial_snapshot()
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
         train_dataset = self.train_dataset
-        # print(len(train_dataset))
+        if indices is not None:
+            train_dataset = torch.utils.data.Subset(train_dataset, indices)
+
         data_collator = self.data_collator
         if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
             train_dataset = self._remove_unused_columns(train_dataset, description="training")
         else:
             data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
-        
-        if self.finetuning_args.static_mix == False and hasattr(self, 'mixer') and self.mixer is not None:
+
+        if self.mixer is not None:
             self.mixer.data_collator = data_collator
 
         dataloader_params = {
@@ -436,665 +362,31 @@ class MixTrainer(CustomSeq2SeqTrainer):
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler(train_dataset)
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            # dataloader_params["worker_init_fn"] = seed_worker
-            
-            # Fix: seed_worker requires 3 arguments, but DataLoader only passes worker_id
-            # Use functools.partial to bind the additional arguments
             if self.args.dataloader_num_workers > 0:
+                # seed_worker takes (worker_id, num_workers, rank); DataLoader only passes worker_id.
                 dataloader_params["worker_init_fn"] = functools.partial(
                     seed_worker,
                     num_workers=self.args.dataloader_num_workers,
-                    rank=self.args.process_index
+                    rank=self.args.process_index,
                 )
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
     def print_mixture_info(self, prefix: str = "[Dataflex]"):
-        """Print the sampling information of the current mixer"""
+        """Log the mixer's current sampling proportions."""
         if self.mixture_manager is None:
-            print(f"{prefix} No mixture manager available")
+            logger.info(f"{prefix} No mixture manager available")
             return
-            
+
         rule = self.mixture_manager.sample_rule
         probs = self.mixture_manager._current_probs()
         sources = self.mixture_manager.names
 
-        if rule == "mixture":
-            msg = f"{prefix} Mixture proportions: {probs} | sources={sources}"
-        elif rule == "stratified":
-            msg = f"{prefix} Stratified proportions (by dataset size): {probs} | sources={sources}"
-        elif rule == "uniform":
-            msg = f"{prefix} Uniform proportions: {probs} | sources={sources}"
-        else:
-            msg = f"{prefix} Proportions (rule={rule}): {probs} | sources={sources}"
-        logger.info(msg)
-
-    # This function is also executed on each GPU
-    @override
-    def _inner_training_loop(
-        self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
-    ):
-        self.accelerator.free_memory()
-        # This batchsize is the per_gpu batchsize!
-        self._train_batch_size = batch_size
-        if self.args.auto_find_batch_size:
-            if self.state.train_batch_size != self._train_batch_size:
-                from accelerate.utils import release_memory
-
-                (self.model_wrapped,) = release_memory(self.model_wrapped)
-                self.model_wrapped = self.model
-
-                # Check for DeepSpeed *after* the initial pass and modify the config
-                if self.is_deepspeed_enabled:
-                    # Temporarily unset `self.args.train_batch_size`
-                    original_bs = self.args.per_device_train_batch_size
-                    self.args.per_device_train_batch_size = self._train_batch_size // max(1, self.args.n_gpu)
-                    self.propagate_args_to_deepspeed(True)
-                    self.args.per_device_train_batch_size = original_bs
-            self.state.train_batch_size = self._train_batch_size
-        logger.debug(f"Currently training with a batch size of: {self._train_batch_size}")
-
-        # Setting up training control variables:
-        # number of training epochs: num_train_epochs
-        # number of training steps per epoch: num_update_steps_per_epoch
-        # total number of training steps to execute: max_steps
-        # _train_batch_size = micro batch size
-        # This is the global batch size
-        total_train_batch_size = self._train_batch_size * args.gradient_accumulation_steps * args.world_size
-
-        # Here we use the initial proportions, at this point train_dataset is None
-        
-        self.print_mixture_info()
-        if self.mixture_manager is not None:
-            if self.finetuning_args.static_mix:
-                logger.info(f"[Dataflex]Initial static mix data with initial mixture proportions.")
-                # Calculate training steps based on train_step or num_train_epochs
-                if self.finetuning_args.train_step > 0:
-                    # Use explicitly set train_step
-                    total_steps = self.finetuning_args.train_step
-                    logger.info(f"[Dataflex] Using train_step={total_steps} for static mix training")
-                else:
-                    # Calculate steps from num_train_epochs and available data
-                    # First, get the original dataset size to estimate steps per epoch
-                    original_dataset_size = sum(len(dataset) for dataset in self.mixture_manager.sources.values())
-                    steps_per_epoch = max(1, original_dataset_size // total_train_batch_size)
-                    total_steps = int(steps_per_epoch * args.num_train_epochs)
-                    logger.info(f"[Dataflex] Calculated train_step={total_steps} from num_train_epochs={args.num_train_epochs} "
-                               f"(dataset_size={original_dataset_size}, steps_per_epoch={steps_per_epoch})")
-                
-                self.train_dataset = self.mixture_manager.rebuild(num_samples = total_train_batch_size * total_steps)
-            else:
-                logger.info(f"[Dataflex]Initial warmup data with initial mixture proportions.")
-                self.train_dataset = self.mixture_manager.rebuild(num_samples = total_train_batch_size * self.finetuning_args.warmup_step)
-        else:
-            logger.warning(f"[Dataflex] No mixture manager available, using original train_dataset")
-        train_dataloader = self.get_train_dataloader()
-        
-        if self.is_fsdp_xla_v2_enabled:
-            train_dataloader = tpu_spmd_dataloader(train_dataloader)
-        (
-            num_train_epochs,
-            num_update_steps_per_epoch, # equals len_dataloader // acc (or len(dataset)/worldsize/microbatchsize/acc)
-            num_examples, # equals dataset length
-            num_train_samples, # equals dataset length * number of epochs
-            epoch_based,
-            len_dataloader, # equals dataset length/worldsize/micro_batchsize
-            max_steps,
-        ) = self.set_initial_training_values(args, train_dataloader, total_train_batch_size)
-        if self.finetuning_args.static_mix:
-            if self.finetuning_args.train_step > 0:
-                max_steps = self.finetuning_args.train_step
-            else:
-                # Use the calculated total_steps from above
-                original_dataset_size = sum(len(dataset) for dataset in self.mixture_manager.sources.values())
-                steps_per_epoch = max(1, original_dataset_size // total_train_batch_size)
-                max_steps = int(steps_per_epoch * args.num_train_epochs)
-        else:
-            # Dynamic mixing: calculate max_steps based on update_times
-            if self.finetuning_args.update_times < 0:
-                # update_times=-1 means update until training finishes
-                # Calculate total steps from num_train_epochs
-                if self.finetuning_args.train_step > 0:
-                    max_steps = self.finetuning_args.train_step
-                    logger.info(f"[Dataflex] Dynamic mix: using train_step={max_steps}")
-                else:
-                    original_dataset_size = sum(len(dataset) for dataset in self.mixture_manager.sources.values())
-                    steps_per_epoch = max(1, original_dataset_size // total_train_batch_size)
-                    max_steps = int(steps_per_epoch * args.num_train_epochs)
-                    logger.info(f"[Dataflex] Dynamic mix: calculated max_steps={max_steps} from num_train_epochs={args.num_train_epochs}")
-            else:
-                # Fixed number of updates
-                max_steps = (self.finetuning_args.warmup_step + self.finetuning_args.update_step * self.finetuning_args.update_times)
-                logger.info(f"[Dataflex] Dynamic mix: max_steps={max_steps} (warmup={self.finetuning_args.warmup_step} + update_step={self.finetuning_args.update_step} * update_times={self.finetuning_args.update_times})")
-        epoch_based = False
-        logger.info(f"[Dataflex]Set max train steps to {max_steps}")
-        logger.info(f"[Dataflex]Set epoch_based = False")
-        num_train_tokens = None
-
-        # Here is the tokens of each GPU
-        if self.args.include_tokens_per_second:
-            num_train_tokens = self.num_tokens(train_dataloader, None if epoch_based else max_steps)
-            # If going by epochs, multiply tokens linearly
-            if len_dataloader is not None and epoch_based:
-                num_train_tokens *= args.num_train_epochs
-            # Otherwise since its steps, we just multiply by grad accum
-            else:
-                num_train_tokens *= args.gradient_accumulation_steps
-
-        if DebugOption.UNDERFLOW_OVERFLOW in self.args.debug:
-            if self.args.n_gpu > 1:
-                # nn.DataParallel(model) replicates the model, creating new variables and module
-                # references registered here no longer work on other gpus, breaking the module
-                raise ValueError(
-                    "Currently --debug underflow_overflow is not supported under DP. Please use DDP"
-                    " (torchrun or torch.distributed.launch (deprecated))."
-                )
-            else:
-                debug_overflow = DebugUnderflowOverflow(self.model)  # noqa
-
-        delay_optimizer_creation = is_sagemaker_mp_enabled() or self.is_fsdp_xla_enabled or self.is_fsdp_enabled
-
-        # Can't delay optimizer creation when using FSDP2: https://github.com/huggingface/accelerate/blob/3f636d626063ffcf9a337c7d3624d61b7d187d59/src/accelerate/accelerator.py#L1404
-        is_fsdp2 = self.is_fsdp_enabled and (getattr(self.accelerator.state.fsdp_plugin, "fsdp_version", 1) == 2)
-        if is_fsdp2:
-            delay_optimizer_creation = False
-
-        # We need to reset the scheduler, as its parameters may be different on subsequent calls
-        if self._created_lr_scheduler:
-            self.lr_scheduler = None
-            self._created_lr_scheduler = False
-
-        if self.is_deepspeed_enabled:
-            self.optimizer, self.lr_scheduler = deepspeed_init(self, num_training_steps=max_steps)
-
-        if not delay_optimizer_creation:
-            self.create_optimizer_and_scheduler(num_training_steps=max_steps)
-
-        self.state = TrainerState(
-            stateful_callbacks=[
-                cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)
-            ]
-        )
-        self.state.is_hyper_param_search = trial is not None
-        self.state.train_batch_size = self._train_batch_size
-
-        # Compute absolute values for logging, eval, and save if given as ratio
-        self.state.compute_steps(args, max_steps)
-
-        # Activate gradient checkpointing if needed
-        if args.gradient_checkpointing:
-            self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=args.gradient_checkpointing_kwargs)
-
-        model = self._wrap_model(self.model_wrapped)
-
-        # as the model is wrapped, don't use `accelerator.prepare`
-        # this is for unhandled cases such as
-        # FSDP-XLA, SageMaker MP/DP, DataParallel, IPEX
-        use_accelerator_prepare = True if model is self.model else False
-
-        if use_accelerator_prepare and self.is_fsdp_enabled:
-            # In case of auto_find_batch_size=True
-            # Remove FSDP wrapping from sub-models.
-            self.model = unwrap_model(self.model, recursive=True)
-
-        if delay_optimizer_creation:
-            if use_accelerator_prepare:
-                # configure fsdp plugin for qlora if any
-                self._fsdp_qlora_plugin_updates()
-                if self.accelerator.mixed_precision != "fp8":
-                    self.model = self.accelerator.prepare(self.model)
-            self.create_optimizer_and_scheduler(num_training_steps=max_steps)
-
-        # prepare using `accelerator` prepare
-        if use_accelerator_prepare:
-            self.model.train()
-            if hasattr(self.lr_scheduler, "step"):
-                if self.use_apex:
-                    model = self.accelerator.prepare(self.model)
-                else:
-                    model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
-            else:
-                # to handle cases wherein we pass "DummyScheduler" such as when it is specified in DeepSpeed config.
-                model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
-                    self.model, self.optimizer, self.lr_scheduler
-                )
-        elif self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
-            # In this case we are in DDP + LOMO, which should be supported
-            self.optimizer = self.accelerator.prepare(self.optimizer)
-
-        if self.is_fsdp_enabled:
-            self.model = self.model_wrapped = model
-
-        # for the rest of this function `model` is the outside model, whether it was wrapped or not
-        if model is not self.model:
-            self.model_wrapped = model
-
-        # backward compatibility
-        if self.is_deepspeed_enabled:
-            self.deepspeed = self.model_wrapped
-
-        # ckpt loading
-        if resume_from_checkpoint is not None:
-            if self.is_deepspeed_enabled:
-                deepspeed_load_checkpoint(
-                    self.model_wrapped, resume_from_checkpoint, load_module_strict=not _is_peft_model(self.model)
-                )
-            elif is_sagemaker_mp_enabled() or self.is_fsdp_enabled:
-                self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
-
-        # Check if saved optimizer or scheduler states exist
-        self._load_optimizer_and_scheduler(resume_from_checkpoint)
-        self._load_scaler(resume_from_checkpoint)
-
-        # important: at this point:
-        # self.model         is the Transformers Model
-        # self.model_wrapped is DDP(Transformers Model), Deepspeed(Transformers Model),
-        # FSDP(Transformers Model), Dynamo Optimized Module(Transformers Model) etc.
-
-        # Train!
-        logger.info("***** Dynamic Running training *****")
-        logger.info(f"  Num examples = {num_examples:,}")
-        logger.info(f"  Num Epochs = {num_train_epochs:,}")
-        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
-        if self.args.per_device_train_batch_size != self._train_batch_size:
-            logger.info(f"  Training with DataParallel so batch size has been adjusted to: {self._train_batch_size:,}")
-        logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size:,}")
-        logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-        logger.info(f"  Total optimization steps = {max_steps:,}")
-        logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
-
-        self.state.epoch = 0
-        start_time = time.time()
-        epochs_trained = 0
-        steps_trained_in_current_epoch = 0
-        steps_trained_progress_bar = None
-
-        # Check if continuing training from a checkpoint
-        if resume_from_checkpoint is not None and os.path.isfile(
-            os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
-        ):
-            self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
-            self.compare_trainer_and_checkpoint_args(self.args, self.state)
-            self._load_callback_state()
-            epochs_trained = int(self.state.global_step // num_update_steps_per_epoch)
-            if not args.ignore_data_skip:
-                steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
-                steps_trained_in_current_epoch *= args.gradient_accumulation_steps
-            else:
-                steps_trained_in_current_epoch = 0
-
-            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
-            logger.info(f"  Continuing training from epoch {epochs_trained}")
-            logger.info(f"  Continuing training from global step {self.state.global_step}")
-            if not args.ignore_data_skip:
-                logger.info(
-                    f"  Will skip the first {epochs_trained} epochs then the first"
-                    f" {steps_trained_in_current_epoch} batches in the first epoch."
-                )
-
-        # Update the references
-        for attr in ("model", "optimizer", "lr_scheduler"):
-            setattr(self.callback_handler, attr, getattr(self, attr))
-        self.callback_handler.train_dataloader = train_dataloader
-
-        self.state.init_training_references(self, max_steps, num_train_epochs, trial)
-
-        # tr_loss is a tensor to avoid synchronization of TPUs through .item()
-        tr_loss = torch.tensor(0.0, device=args.device)
-        # _total_loss_scalar is updated everytime .item() has to be called on tr_loss and stores the sum of all losses
-        self._total_loss_scalar = 0.0
-        self._globalstep_last_logged = self.state.global_step
-        model.zero_grad()
-        grad_norm: Optional[float] = None
-        learning_rate = None
-        self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
-
-        if args.eval_on_start:
-            self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
-  
-        # Give up epoch logic, it is equivalent to training only one epoch, through step to train
-        current_dataloader = train_dataloader
-        epoch = 0
-        if self.finetuning_args.static_mix == False and self.state.global_step < self.finetuning_args.warmup_step:
-            logger.info("[Dataflex] Model warmup in progress...")
-        # if hasattr(current_dataloader, "set_epoch"):
-        #     current_dataloader.set_epoch(epoch)
-        
-        # Reset the past mems state at the beginning of each epoch if necessary.
-        if args.past_index >= 0:
-            self._past = None
-
-        steps_in_epoch = max_steps * args.gradient_accumulation_steps
-        self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
-
-        if resume_from_checkpoint is not None and steps_trained_in_current_epoch == 0:
-            self._load_rng_state(resume_from_checkpoint)
-
-        rng_to_sync = False
-        steps_skipped = 0
-        if steps_trained_in_current_epoch > 0:
-            current_dataloader = skip_first_batches(current_dataloader, steps_trained_in_current_epoch)
-            steps_skipped = steps_trained_in_current_epoch
-            steps_trained_in_current_epoch = 0
-            rng_to_sync = True
-
-        step = -1
-        current_iterator = iter(current_dataloader)
-        # We chunkify the epoch iterator into gradient accumulation steps `n` batches
-        remainder = num_examples % args.gradient_accumulation_steps
-        if remainder == 0:
-            remainder = args.gradient_accumulation_steps
-        update_step = -1
-        # Total number of model updates in an epoch
-        total_updates = steps_in_epoch // args.gradient_accumulation_steps + 1
-        if args.gradient_accumulation_steps == 1:
-            total_updates -= 1
-        for _ in range(total_updates):
-            update_step += 1
-            # Number of batches to get, usually gradient_accumulation_steps, each time backward propagation once, each batch has batch_size samples
-            num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
-
-            batch_samples, num_items_in_batch = self.get_batch_samples(current_iterator, num_batches, args.device)
-            # transformers 4.55's `training_step` divides the loss by this, and only ever
-            # assigns it inside its own `_inner_training_loop` -- the method replaced here.
-            self.current_gradient_accumulation_steps = len(batch_samples)
-            # Iterate over the samples in the current batch
-            for i, inputs in enumerate(batch_samples):
-                step += 1  # Increase global step each time iteration
-
-                # Check if the synchronization step has been reached, or if it is the last step of the current epoch
-                do_sync_step = (step + 1) % args.gradient_accumulation_steps == 0 or (step + 1) == steps_in_epoch
-                
-                # Since we are using prefetching, we need to manually set sync_gradients
-                self.accelerator.gradient_state._set_sync_gradients(do_sync_step)
-
-                # If we need to record the number of input tokens
-                if self.args.include_num_input_tokens_seen:
-                    main_input_name = getattr(self.model, "main_input_name", "input_ids")  # Get the main input name of the model (default is input_ids)
-                    
-                    # Check if the input of the model contains the main input name
-                    if main_input_name not in inputs:
-                        logger.warning(
-                            "Tried to track the number of tokens seen, however the current model is "
-                            "not configured properly to know what item is the input. To fix this, add "
-                            "a `main_input_name` attribute to the model class you are using."
-                        )
-                    else:
-                        # Calculate the number of tokens in the current input, and add it to the total number of tokens seen
-                        input_tokens = inputs[main_input_name].numel()  # Calculate the number of tokens in the current input
-                        input_tokens = torch.tensor(input_tokens, device=self.args.device, dtype=torch.int64)  # Convert to tensor
-                        self.state.num_input_tokens_seen += self.accelerator.gather(input_tokens).sum().item()  # Add the number of tokens seen
-
-                # If we need to synchronize the random number generator (for resuming training)
-                if rng_to_sync:
-                    self._load_rng_state(resume_from_checkpoint)  # Load the state of the random number generator from the checkpoint
-                    rng_to_sync = False  # Reset the synchronization flag
-
-                # If resuming training and there are still steps to train in the current epoch, skip the trained steps
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1  # Decrease the number of remaining training steps
-                    if steps_trained_progress_bar is not None:
-                        steps_trained_progress_bar.update(1)  # Update the progress bar of the trained steps
-                    if steps_trained_in_current_epoch == 0:
-                        self._load_rng_state(resume_from_checkpoint)  # Load the state of the random number generator from the checkpoint
-                    continue  # Skip this iteration, enter the next iteration
-                elif steps_trained_progress_bar is not None:
-                    steps_trained_progress_bar.close()  # Close the progress bar of the trained steps
-                    steps_trained_progress_bar = None  # Reset the progress bar
-
-                # Whenever the step reaches the gradient accumulation steps, perform one synchronization operation
-                if step % args.gradient_accumulation_steps == 0:
-                    self.control = self.callback_handler.on_step_begin(args, self.state, self.control)  # Perform the callback at the beginning of the step
-
-                # When training the generator, avoid depending on `accelerator.accumulate`, explicitly set whether to synchronize
-                context = (
-                    functools.partial(self.accelerator.no_sync, model=model)  # If not the last batch, then do not synchronize
-                    if i != len(batch_samples) - 1
-                    and self.accelerator.distributed_type != DistributedType.DEEPSPEED
-                    else contextlib.nullcontext  # If not the last batch, then do not synchronize
-                )
-                
-                with context():  # Train in the non-synchronized context
-                    tr_loss_step = self.training_step(model, inputs, num_items_in_batch)  # Perform one training step, return the loss value of the step
-
-                # Check if the loss is NaN or Infinity, if so, use the previous loss value
-                if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_xla_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
-                ):
-                    tr_loss = tr_loss + tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)  # If the loss is NaN or Inf, then use the average loss
-                else:
-                    if tr_loss.device != tr_loss_step.device:
-                        raise ValueError(
-                            f"Calculated loss must be on the original device: {tr_loss.device} but device in use is {tr_loss_step.device}"
-                        )  # Check if the calculated loss is on the original device
-                    tr_loss = tr_loss + tr_loss_step  # Add the loss of the current step to the total loss
-
-                # Add the number of floating point operations
-                self.current_flos += float(self.floating_point_ops(inputs))
-
-                # for odm
-                # Update batch info for ODM mixer (if applicable)
-                if (self.finetuning_args.static_mix == False and 
-                    hasattr(self, 'mixer') and self.mixer is not None and 
-                    hasattr(self.mixer, 'update_batch_info')):
-                    # Extract domain_id from batch
-                    domain_id = inputs.get('domain_id')
-                    if domain_id is not None:
-                        # Get the first domain_id in batch (assuming batch is homogeneous)
-                        if isinstance(domain_id, torch.Tensor):
-                            domain_id = domain_id[0].item() if domain_id.numel() > 0 else None
-                        if domain_id is not None:
-                            batch_loss = tr_loss_step.item() if isinstance(tr_loss_step, torch.Tensor) else tr_loss_step
-                            self.mixer.update_batch_info(batch_loss, domain_id)
-
-                # Whenever the step reaches the gradient accumulation steps, synchronize the gradients
-                if do_sync_step:
-                    # Since we are using prefetching, we need to manually set sync_gradients to True
-                    self.accelerator.gradient_state._set_sync_gradients(True)
-
-                    # Perform gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                        if is_sagemaker_mp_enabled() and args.fp16:
-                            _grad_norm = self.optimizer.clip_master_grads(args.max_grad_norm)
-                        elif self.use_apex:
-                            # Revert to normal clipping otherwise, handle Apex or full precision
-                            _grad_norm = nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer),
-                                args.max_grad_norm,
-                            )
-                        else:
-                            _grad_norm = self.accelerator.clip_grad_norm_(
-                                model.parameters(),
-                                args.max_grad_norm,
-                            )
-
-                        if (
-                            is_accelerate_available()
-                            and self.accelerator.distributed_type == DistributedType.DEEPSPEED
-                        ):
-                            grad_norm = model.get_global_grad_norm()
-                            # In some cases the grad norm may not return a float
-                            if hasattr(grad_norm, "item"):
-                                grad_norm = grad_norm.item()
-                        else:
-                            grad_norm = _grad_norm
-
-                    self.control = self.callback_handler.on_pre_optimizer_step(args, self.state, self.control)
-
-                    self.optimizer.step()
-
-                    self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
-
-                    # get leaning rate before update
-                    learning_rate = self._get_learning_rate()
-
-                    if not self.accelerator.optimizer_step_was_skipped:
-                        # Delay optimizer scheduling until metrics are generated
-                        if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                            self.lr_scheduler.step()
-
-                    model.zero_grad()
-                    # Synchronize the precision and then backward propagation, at this point each GPU has processed per_gpu_batch_size * acc data, global_step+1
-                    self.state.global_step += 1
-                    self.state.epoch = (step + 1 + steps_skipped) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                    self._maybe_log_save_evaluate(
-                        tr_loss,
-                        grad_norm,
-                        model,
-                        trial,
-                        epoch,
-                        ignore_keys_for_eval,
-                        start_time,
-                        # learning_rate=learning_rate,
-                    )
-
-                    # Dynamic training update
-                    if (
-                        self.finetuning_args.static_mix == False and(
-                        self.state.global_step < max_steps and (
-                        self.state.global_step == self.finetuning_args.warmup_step or
-                        (self.state.global_step > self.finetuning_args.warmup_step and
-                        (self.state.global_step - self.finetuning_args.warmup_step) % self.finetuning_args.update_step == 0)))
-                    ):
-                        self.accelerator.wait_for_everyone()
-                        torch.cuda.empty_cache()
-                        if dist.is_initialized():
-                            dist.barrier()
-
-                        update_times = (self.state.global_step - self.finetuning_args.warmup_step) // self.finetuning_args.update_step + 1
-                        logger.info(f"[Dataflex] Model training paused, starting the {update_times}th dynamic data mixture...")
-
-                        # Pass current training batch to mixer for λ_t computation
-                        # This aligns better with Algorithm 1 which uses current batch
-                        extra_args = dict(
-                            batch=inputs,
-                            domain_ids=inputs.get('domain_id') if 'domain_id' in inputs else None,
-                            data_collator=self.data_collator,
-                            dataset=self.train_dataset
-                        )
-
-                        probs = self.mixer.mix(
-                            model=model,
-                            step_id=self.state.global_step,
-                            **extra_args
-                        )
-
-                        self.mixture_manager.set_proportions(probs)
-                        self.train_dataset = self.mixture_manager.rebuild(num_samples = total_train_batch_size * self.finetuning_args.update_step)
-                        train_loader = self.get_train_dataloader()
-                        current_iterator = iter(train_loader)
-
-                        if self.accelerator.is_main_process:
-                            logger.info(f"[Dataflex] Updated dataloader at step {self.state.global_step}, new mixture proportions generated.")
-                            self.print_mixture_info()
-
-                else:
-                    self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
-
-                # PyTorch/XLA relies on the data loader to insert the mark_step for
-                # each step. Since we are breaking the loop early, we need to manually
-                # insert the mark_step here.
-                if self.control.should_epoch_stop or self.control.should_training_stop:
-                    if is_torch_xla_available():
-                        xm.mark_step()
-                    break
-            # We also need to break out of the nested loop
-            if self.control.should_epoch_stop or self.control.should_training_stop:
-                if is_torch_xla_available():
-                    xm.mark_step()
-                break
-        if step < 0:
-            logger.warning(
-                "There seems not to be a single sample in your epoch_iterator, stopping training at step"
-                f" {self.state.global_step}! This is expected if you're using an IterableDataset and set"
-                f" num_steps ({max_steps}) higher than the number of available samples."
-            )
-            self.control.should_training_stop = True
-
-        self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-        self._maybe_log_save_evaluate(
-            tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time
-        )
-
-        if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
-            if is_torch_xla_available():
-                # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
-                xm.master_print(met.metrics_report())
-            else:
-                logger.warning(
-                    "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
-                    "configured. Check your training configuration if this is unexpected."
-                )
-
-        # End the main training loop
-        if args.past_index and hasattr(self, "_past"):
-            # Clean the state at the end of training
-            delattr(self, "_past")
-
-        logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
-        if args.load_best_model_at_end and self.state.best_model_checkpoint is not None:
-            # Wait for everyone to get here so we are sure the model has been saved by process 0.
-            if is_torch_xla_available():
-                xm.rendezvous("load_best_model_at_end")
-            elif args.parallel_mode == ParallelMode.DISTRIBUTED:
-                dist.barrier()
-            elif is_sagemaker_mp_enabled():
-                smp.barrier()
-
-            self._load_best_model()
-
-        # add remaining tr_loss
-        self._total_loss_scalar += tr_loss.item()
-        effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
-        train_loss = self._total_loss_scalar / effective_global_step
-
-        metrics = speed_metrics(
-            "train",
-            start_time,
-            num_samples=num_train_samples,
-            num_steps=self.state.max_steps,
-            num_tokens=num_train_tokens,
-        )
-        self.store_flos()
-        metrics["total_flos"] = self.state.total_flos
-        metrics["train_loss"] = train_loss
-
-        self.is_in_train = False
-
-        self._memory_tracker.stop_and_update_metrics(metrics)
-
-        self.log(metrics)
-
-        run_dir = self._get_output_dir(trial)
-        checkpoints_sorted = self._sorted_checkpoints(use_mtime=False, output_dir=run_dir)
-
-        # Delete the last checkpoint when save_total_limit=1 if it's different from the best checkpoint and process allowed to save.
-        if self.args.should_save and self.state.best_model_checkpoint is not None and self.args.save_total_limit == 1:
-            for checkpoint in checkpoints_sorted:
-                if not os.path.samefile(checkpoint, self.state.best_model_checkpoint):
-                    logger.info(f"Deleting older checkpoint [{checkpoint}] due to args.save_total_limit")
-                    shutil.rmtree(checkpoint, ignore_errors=True)
-
-        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
-
-        # Wait for the checkpoint to be uploaded.
-        self._finish_current_push()
-
-        # Save DoReMi average weights at the end of training (Algorithm 1 line 36)
-        if hasattr(self, 'mixer') and self.mixer is not None:
-            if hasattr(self.mixer, 'save_average_weights'):
-                if self.accelerator.is_main_process:
-                    logger.info("[Dataflex] Saving DoReMi average weights for Step 2...")
-                    self.mixer.save_average_weights(args.output_dir)
-                    logger.info("[Dataflex] DoReMi Step 2 complete. Use the saved average weights for Step 2.")
-
-        # After training we make sure to retrieve back the original forward pass method
-        # for the embedding layer by removing the forward post hook.
-        if self.neftune_noise_alpha is not None:
-            self._deactivate_neftune(self.model)
-
-        return TrainOutput(self.state.global_step, train_loss, metrics)
+        labels = {
+            "mixture": "Mixture proportions",
+            "stratified": "Stratified proportions (by dataset size)",
+            "uniform": "Uniform proportions",
+        }
+        label = labels.get(rule, f"Proportions (rule={rule})")
+        logger.info(f"{prefix} {label}: {probs} | sources={sources}")

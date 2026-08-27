@@ -4,7 +4,7 @@ DataFlex is a data-centric training system built on top of [LLaMA-Factory](https
 
 ## Installation
 
-Requires Python 3.11+. LlamaFactory (0.9.4 - 0.9.6) installs automatically.
+Requires Python 3.11+ and LlamaFactory 0.9.5+, installed automatically. Works on transformers 4.55 through 5.6; the newer model families (Qwen3.5, Gemma 4) need transformers 5.5+.
 
 ```bash
 git clone https://github.com/OpenDCAI/DataFlex.git
