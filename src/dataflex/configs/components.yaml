@@ -40,6 +40,18 @@ selectors:
       seed: 123
       save_interval: 16
 
+  icons:
+    name: icons
+    params:
+      cache_dir: ../dataflex_saves/icons_output
+      gradient_type: adam
+      proj_dim: 4096
+      seed: 123
+      save_interval: 16
+      # Sizes of each task's slice in the concatenated eval_dataset; must sum to
+      # len(eval_dataset). null / omitted = one task = plain LESS.
+      task_boundaries: null
+
   cluster_less:
     name: cluster_less
     params:
