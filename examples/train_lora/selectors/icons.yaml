@@ -1,5 +1,5 @@
 ### model
-model_name_or_path: meta-llama/Llama-3.1-8B
+model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
 trust_remote_code: true
 
 ### method
@@ -11,9 +11,9 @@ lora_rank: 16
 lora_alpha: 8
 
 ### dataset
-dataset: alpaca_en_demo
-template: llama3
-cutoff_len: 4096
+dataset: mmfinereason_sft_demo
+template: qwen2_vl
+cutoff_len: 16384  # vision tokens budget.
 # max_samples: 100000000
 overwrite_cache: true
 preprocessing_num_workers: 16
@@ -22,7 +22,7 @@ dataloader_num_workers: 0
 seed: 42
 
 ### output
-output_dir: ../dataflex_saves/Llama-3.1-8B/icons
+output_dir: ../dataflex_saves/Qwen25-VL-7B/icons
 logging_steps: 10
 save_steps: 100
 plot_loss: true
@@ -34,7 +34,7 @@ report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
 
 ### train
 per_device_train_batch_size: 1
-gradient_accumulation_steps: 1
+gradient_accumulation_steps: 8
 learning_rate: 1.0e-4
 num_train_epochs: 1.0
 lr_scheduler_type: cosine
@@ -53,7 +53,7 @@ update_times: 2
 ## eval
 # eval_dataset is the K task validation sets concatenated in order; set
 # task_boundaries in components.yaml to the size of each task's slice.
-eval_dataset: alpaca_zh_demo
+eval_dataset: mmfinereason_eval_demo
 per_device_eval_batch_size: 1
 metric_for_best_model: eval_loss
 greater_is_better: false
