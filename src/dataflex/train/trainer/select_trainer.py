@@ -20,6 +20,7 @@ steps. `ReorderTrainer` and `LegoTrainer` reuse all of it by presenting themselv
 as a selector.
 """
 
+import functools
 from typing import List, Optional
 
 import numpy as np
@@ -252,7 +253,13 @@ class SelectTrainer(DataflexTrainerMixin, CustomSeq2SeqTrainer):
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler(train_dataset)
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["worker_init_fn"] = seed_worker
+            if self.args.dataloader_num_workers > 0:
+                # seed_worker takes (worker_id, num_workers, rank); DataLoader only passes worker_id.
+                dataloader_params["worker_init_fn"] = functools.partial(
+                    seed_worker,
+                    num_workers=self.args.dataloader_num_workers,
+                    rank=self.args.process_index,
+                )
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))

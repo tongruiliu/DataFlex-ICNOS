@@ -224,7 +224,6 @@ def launch():
         patch_reorder_get_dataset(cfg)
     elif train_type == 'dynamic_lego':
         patch_lego_get_dataset()
-    patch_train_from_scratch_pad()
 
     from llamafactory.train.tuner import run_exp
     run_exp()

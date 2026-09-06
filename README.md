@@ -87,6 +87,16 @@ We summarize repositories related to Data Selection, Data Mixture, and Data Rewe
 
 Please use the following commands for environment setup and installation👇
 
+Install torch first, so pip does not resolve a different build and then have to replace it:
+
+```bash
+pip install --index-url https://download.pytorch.org/whl/cu124 \
+    torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+Then install DataFlex:
+
 ```bash
 pip install dataflex
 ```
@@ -99,15 +109,17 @@ cd DataFlex
 pip install -e .
 ```
 
-> **Note:** Requires Python 3.11+ and LlamaFactory 0.9.5+, installed automatically along with the other core dependencies. Works on transformers 4.55 through 5.6; the newer model families (Qwen3.5, Gemma 4) need transformers 5.5+.
+Every config under `examples/deepspeed` needs DeepSpeed, which ships as an optional extra:
 
-> ```bash
-> pip install --index-url https://download.pytorch.org/whl/cu124 \
->     torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
-> python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-> ```
+```bash
+pip install "dataflex[deepspeed]"        # from source: pip install -e ".[deepspeed]"
+```
+
+> **Note:** Requires Python 3.11+ and LlamaFactory 0.9.5+, installed automatically along with the other core dependencies. Works on transformers 4.55 through 5.6; the newer model families (Qwen3.5, Gemma 4) need transformers 5.5+. We recommend transformers 5.3+ if you need `train_from_scratch` under DeepSpeed ZeRO-3.
 >
-> The LESS selector needs TRAK, which is an optional extra: `pip install dataflex[less]`.
+> The `deepspeed` extra stays below 0.17 on purpose: 0.17+ fails to import on the torch pinned above. On a newer torch you are free to lift that cap.
+>
+> The LESS selector needs TRAK, which is another optional extra: `pip install dataflex[less]`.
 
 The launch command is similar to [LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory).
 Below is an example using [LESS](https://arxiv.org/abs/2402.04333) :
