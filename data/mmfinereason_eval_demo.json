@@ -1,0 +1,18 @@
+[
+  {
+    "instruction": "<image>\nA transistor, which may be approximated as a hemispherical heat source of radius ro = 0.1 mm, is embedded in a large silicon substrate (k = 125 W/m$\\cdot$  K) and dissipates heat at a rate q. All boundaries of the silicon are maintained at an ambient temperature of T$\\infty$= 27C,except for the top surface, which is well insulated.evaluate the surface temperature of the heat source for q =4 W.\nOptions:\nA. 340.93K\nB. 350.93K\nC. 360.93K\nAnswer with the option letter only.",
+    "input": "",
+    "output": "B",
+    "images": [
+      "figures/eval_00000_0.png"
+    ]
+  },
+  {
+    "instruction": "<image>\nSee the following phase diagram below, where there are 5 points labeled as (A), (B), (C), (D), and (E), respectively.  At which point will the substancemce represented by the phase diagram be solely in the solid phase at equilibrium?\nOptions:\nA. (A)\nB. (B)\nC. (C)\nD. (D)\nE. (E)\nAnswer with the option letter only.",
+    "input": "",
+    "output": "B",
+    "images": [
+      "figures/eval_00001_0.png"
+    ]
+  }
+]
