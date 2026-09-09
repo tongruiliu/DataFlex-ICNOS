@@ -815,5 +815,23 @@
       "prompt": "content"
     },
     "folder": "python"
+  },
+  "mmfinereason_sft": {
+    "file_name": "../../sft_data",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "question",
+      "response": "qwen3vl_235b_thinking_response",
+      "images": "image"
+    }
+  },
+  "mmfinereason_eval": {
+    "file_name": "../../eval_data/icons_eval.parquet",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "question",
+      "response": "response",
+      "images": "images"
+    }
   }
 }
