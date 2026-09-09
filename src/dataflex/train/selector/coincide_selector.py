@@ -140,6 +140,13 @@ class CoincideSelector(Selector):
             )
         return self._embedding_model
 
+    def _model_config(self, model):
+        """Return the underlying HF config, unwrapping any DDP / DeepSpeed engine. """
+        if hasattr(model, "config"):
+            return model.config
+        unwrapped = self.accelerator.unwrap_model(model)
+        return unwrapped.config
+
     def _resolve_layers(self, num_hidden_layers: int) -> List[int]:
         """Layers to pool. hidden_states has length num_hidden_layers+1, index 0
         being the embedding layer and index -1 the last transformer block."""
@@ -252,9 +259,10 @@ class CoincideSelector(Selector):
 
         os.makedirs(os.path.dirname(feature_path), exist_ok=True)
         emb_model = self._get_embedding_model(model)
-        num_hidden_layers = int(emb_model.config.num_hidden_layers)
+        emb_config = self._model_config(emb_model)
+        num_hidden_layers = int(emb_config.num_hidden_layers)
         self._resolve_layers(num_hidden_layers)
-        image_token_id = self._resolve_image_token_id(emb_model.config)
+        image_token_id = self._resolve_image_token_id(emb_config)
 
         indexed_dataset = list(range(len(self.dataset)))
 

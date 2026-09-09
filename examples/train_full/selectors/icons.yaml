@@ -10,7 +10,7 @@ finetuning_type: full
 deepspeed: examples/deepspeed/ds_z3_config.json  # ZeRO-3 for full-param
 
 ### dataset
-dataset: mmfinereason_sft
+dataset: mmfinereason_sft_demo
 template: qwen2_vl
 cutoff_len: 16384
 overwrite_cache: false
@@ -21,7 +21,7 @@ seed: 42
 ### output
 output_dir: ../dataflex_saves/Qwen25-VL-7B/icons_full
 logging_steps: 10
-save_steps: 100
+save_steps: 50
 plot_loss: true
 save_only_model: false
 overwrite_output_dir: true
@@ -49,12 +49,12 @@ update_step: 1900
 update_times: 2
 
 ## eval
-eval_dataset: mmfinereason_eval
+eval_dataset: mmfinereason_eval_demo
 per_device_eval_batch_size: 1
 metric_for_best_model: eval_loss
 greater_is_better: false
 load_best_model_at_end: false
 eval_strategy: steps
-eval_steps: 100
+eval_steps: 50
 
 # FORCE_TORCHRUN=1 DISABLE_VERSION_CHECK=1 dataflex-cli train examples/train_full/selectors/icons_full.yaml
