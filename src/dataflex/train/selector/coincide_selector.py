@@ -11,6 +11,11 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForImageTextToText
+from transformers.integrations.deepspeed import (
+    is_deepspeed_zero3_enabled,
+    set_hf_deepspeed_config,
+    unset_hf_deepspeed_config,
+)
 
 from dataflex.core.registry import register_selector
 from dataflex.utils.logging import logger
@@ -70,6 +75,8 @@ class CoincideSelector(Selector):
         embedding_layers: Optional[List[int]] = None,
         num_clusters: int = 10000,
         clustering_batch_size: int = 8,
+        clustering_num_workers: int = 4,
+        clustering_device: str = "auto",
         clustering_max_iter: int = 10,
         assignment_chunk_size: int = 4096,
         temperature: float = 1.0,
@@ -79,11 +86,15 @@ class CoincideSelector(Selector):
     ):
         super().__init__(dataset, accelerator, data_collator, cache_dir)
 
-        self.embedding_model_name_or_path = embedding_model_name_or_path
+        self.embedding_model_name_or_path = embedding_model_name_or_path or os.environ.get(
+            "DATAFLEX_COINCIDE_EMBEDDING_MODEL"
+        )
         self.embedding_model_dtype = embedding_model_dtype
         self.embedding_layers = embedding_layers
         self.num_clusters = num_clusters
         self.clustering_batch_size = clustering_batch_size
+        self.clustering_num_workers = max(0, int(clustering_num_workers))
+        self.clustering_device = str(clustering_device).lower()
         self.clustering_max_iter = clustering_max_iter
         self.assignment_chunk_size = assignment_chunk_size
         self.temperature = float(temperature)
@@ -102,7 +113,8 @@ class CoincideSelector(Selector):
         os.makedirs(self.cache_dir, exist_ok=True)
         logger.info(
             f"[CoincideSelector] initialized. num_clusters={self.num_clusters}, "
-            f"temperature={self.temperature}. Features/clusters cached in {self.cache_dir}"
+            f"temperature={self.temperature}, data_workers={self.clustering_num_workers}. "
+            f"Features/clusters cached in {self.cache_dir}"
         )
 
     # ------------------------------------------------------------------
@@ -128,16 +140,28 @@ class CoincideSelector(Selector):
             "fp32": torch.float32,
         }
         dtype = dtype_map.get(self.embedding_model_dtype, "auto")
-        self._embedding_model = AutoModelForImageTextToText.from_pretrained(
-            self.embedding_model_name_or_path,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-        ).to(self.device)
+        ds_config = None
+        if is_deepspeed_zero3_enabled():
+            plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+            ds_config = getattr(plugin, "hf_ds_config", None)
+            if ds_config is None:
+                raise RuntimeError("Cannot isolate the COINCIDE reference model from ZeRO-3.")
+            unset_hf_deepspeed_config()
+        try:
+            self._embedding_model = AutoModelForImageTextToText.from_pretrained(
+                self.embedding_model_name_or_path,
+                torch_dtype=dtype,
+                attn_implementation="flash_attention_2",
+                trust_remote_code=True,
+            ).to(self.device)
+        finally:
+            if ds_config is not None:
+                set_hf_deepspeed_config(ds_config)
         self._embedding_model.eval()
         if self.accelerator.is_main_process:
             logger.info(
                 f"[CoincideSelector] Loaded standalone embedding model from "
-                f"{self.embedding_model_name_or_path}"
+                f"{self.embedding_model_name_or_path} with FlashAttention-2"
             )
         return self._embedding_model
 
@@ -282,7 +306,9 @@ class CoincideSelector(Selector):
             indexed_dataset,
             batch_size=self.clustering_batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=self.clustering_num_workers,
+            pin_memory=True,
+            prefetch_factor=2 if self.clustering_num_workers > 0 else None,
             collate_fn=collate_indices,
         )
         # prepare() shards the dataloader across ranks so each rank embeds only
@@ -291,6 +317,13 @@ class CoincideSelector(Selector):
 
         was_training = emb_model.training
         emb_model.eval()
+        base_model = self.accelerator.unwrap_model(emb_model)
+        forward_params = inspect.signature(base_model.forward).parameters
+        forward_kwargs = {"output_hidden_states": True, "return_dict": True}
+        if "logits_to_keep" in forward_params:
+            forward_kwargs["logits_to_keep"] = 1
+        elif "num_logits_to_keep" in forward_params:
+            forward_kwargs["num_logits_to_keep"] = 1
         features = []
         indices_seen = []
         with torch.no_grad():
@@ -304,13 +337,6 @@ class CoincideSelector(Selector):
                 batch = _move_to_device(batch, self.device)
                 # Selection only needs hidden states.
                 model_inputs = {k: v for k, v in batch.items() if k != "labels"}
-                forward_kwargs = {"output_hidden_states": True, "return_dict": True}
-                base_model = self.accelerator.unwrap_model(emb_model)
-                forward_params = inspect.signature(base_model.forward).parameters
-                if "logits_to_keep" in forward_params:
-                    forward_kwargs["logits_to_keep"] = 1
-                elif "num_logits_to_keep" in forward_params:
-                    forward_kwargs["num_logits_to_keep"] = 1
                 outputs = emb_model(**model_inputs, **forward_kwargs)
                 pooled = self._pool_multimodal_features(
                     outputs.hidden_states,
@@ -320,9 +346,16 @@ class CoincideSelector(Selector):
                 )
                 features.append(pooled)
                 indices_seen.append(indices.cpu())
+                del outputs, pooled, model_inputs, batch
 
         if was_training and self.embedding_model_name_or_path is None:
             emb_model.train()
+        if self.embedding_model_name_or_path is not None:
+            self._embedding_model = None
+            del base_model, emb_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info("[CoincideSelector] Released standalone embedding model from GPU memory.")
 
         features = torch.cat(features, dim=0) if features else torch.empty(0)
         indices_seen = torch.cat(indices_seen, dim=0) if indices_seen else torch.empty(0, dtype=torch.long)
@@ -408,6 +441,14 @@ class CoincideSelector(Selector):
         return torch.cat(assignments, dim=0)
 
     def _run_spherical_kmeans(self, features: torch.Tensor) -> torch.Tensor:
+        use_cuda = self.clustering_device == "cuda" or (
+            self.clustering_device == "auto" and self.device.type == "cuda"
+        )
+        if self.clustering_device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("clustering_device must be one of: auto, cpu, cuda")
+        if use_cuda:
+            return self._run_spherical_kmeans_cuda(features)
+
         n_samples = len(features)
         k = self._resolve_num_clusters(n_samples)
         generator = torch.Generator(device="cpu")
@@ -432,6 +473,60 @@ class CoincideSelector(Selector):
             centers = new_centers
 
         return self._assign_to_centers(features, centers).to(torch.long)
+
+    def _run_spherical_kmeans_cuda(self, features: torch.Tensor) -> torch.Tensor:
+        """Chunked fp16 cosine assignment on GPU with fp32 centroid updates."""
+        if not torch.cuda.is_available():
+            raise RuntimeError("clustering_device=cuda requested, but CUDA is unavailable")
+
+        n_samples, feature_dim = features.shape
+        k = self._resolve_num_clusters(n_samples)
+        generator = torch.Generator(device="cpu").manual_seed(self.seed)
+        init_indices = torch.randperm(n_samples, generator=generator)[:k]
+        centers = features[init_indices].to(self.device, dtype=torch.float16)
+        centers = centers / centers.norm(dim=1, keepdim=True).clamp(min=1e-12)
+
+        logger.info(
+            f"[CoincideSelector] Running spherical k-means on {self.device} "
+            f"(N={n_samples}, K={k}, D={feature_dim}, fp16 assignment)."
+        )
+        with torch.inference_mode():
+            for iteration in range(max(1, self.clustering_max_iter)):
+                new_centers = torch.zeros(k, feature_dim, device=self.device, dtype=torch.float32)
+                counts = torch.zeros(k, device=self.device, dtype=torch.float32)
+                for start in range(0, n_samples, self.assignment_chunk_size):
+                    x = features[start:start + self.assignment_chunk_size].to(
+                        self.device, dtype=torch.float16
+                    )
+                    assignments = (x @ centers.T).argmax(dim=1)
+                    new_centers.index_add_(0, assignments, x.float())
+                    counts += torch.bincount(assignments, minlength=k).float()
+                    del x, assignments
+
+                empty = counts == 0
+                new_centers /= counts.clamp(min=1.0).unsqueeze(1)
+                if empty.any():
+                    replacement = torch.randperm(n_samples, generator=generator)[: int(empty.sum())]
+                    new_centers[empty] = features[replacement].to(self.device)
+                new_centers /= new_centers.norm(dim=1, keepdim=True).clamp(min=1e-12)
+                centers = new_centers.to(torch.float16)
+                logger.info(
+                    f"[CoincideSelector] CUDA spherical k-means iteration "
+                    f"{iteration + 1}/{self.clustering_max_iter} complete."
+                )
+
+            del new_centers, counts
+            result = torch.empty(n_samples, dtype=torch.long)
+            for start in range(0, n_samples, self.assignment_chunk_size):
+                x = features[start:start + self.assignment_chunk_size].to(
+                    self.device, dtype=torch.float16
+                )
+                result[start:start + len(x)] = (x @ centers.T).argmax(dim=1).cpu()
+                del x
+
+        del centers
+        torch.cuda.empty_cache()
+        return result
 
     # ------------------------------------------------------------------
     # Distributed helpers

@@ -86,6 +86,8 @@ selectors:
       embedding_layers: null
       num_clusters: 10000                  # actual K = min(num_clusters, N)
       clustering_batch_size: 8
+      clustering_num_workers: 4           # workers per rank for image loading/collation
+      clustering_device: auto             # CUDA when available, otherwise CPU
       clustering_max_iter: 10
       assignment_chunk_size: 4096
       temperature: 1.0                     # tau in exp(S_i / (tau * D_i))
