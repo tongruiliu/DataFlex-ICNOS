@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import math
 import os
 import shutil
@@ -142,10 +143,16 @@ class CoincideSelector(Selector):
 
     def _model_config(self, model):
         """Return the underlying HF config, unwrapping any DDP / DeepSpeed engine. """
-        if hasattr(model, "config"):
-            return model.config
         unwrapped = self.accelerator.unwrap_model(model)
-        return unwrapped.config
+        config = getattr(unwrapped, "config", None)
+        if config is None:
+            config = getattr(model, "config", None)
+        if config is None:
+            raise ValueError(
+                f"[CoincideSelector] Cannot find the Hugging Face config on "
+                f"{type(model).__name__} or its unwrapped model."
+            )
+        return config
 
     def _resolve_layers(self, num_hidden_layers: int) -> List[int]:
         """Layers to pool. hidden_states has length num_hidden_layers+1, index 0
@@ -260,7 +267,8 @@ class CoincideSelector(Selector):
         os.makedirs(os.path.dirname(feature_path), exist_ok=True)
         emb_model = self._get_embedding_model(model)
         emb_config = self._model_config(emb_model)
-        num_hidden_layers = int(emb_config.num_hidden_layers)
+        text_config = getattr(emb_config, "text_config", emb_config)
+        num_hidden_layers = int(text_config.num_hidden_layers)
         self._resolve_layers(num_hidden_layers)
         image_token_id = self._resolve_image_token_id(emb_config)
 
@@ -294,7 +302,16 @@ class CoincideSelector(Selector):
                 position=self.accelerator.process_index,
             ):
                 batch = _move_to_device(batch, self.device)
-                outputs = emb_model(**batch, output_hidden_states=True, return_dict=True)
+                # Selection only needs hidden states.
+                model_inputs = {k: v for k, v in batch.items() if k != "labels"}
+                forward_kwargs = {"output_hidden_states": True, "return_dict": True}
+                base_model = self.accelerator.unwrap_model(emb_model)
+                forward_params = inspect.signature(base_model.forward).parameters
+                if "logits_to_keep" in forward_params:
+                    forward_kwargs["logits_to_keep"] = 1
+                elif "num_logits_to_keep" in forward_params:
+                    forward_kwargs["num_logits_to_keep"] = 1
+                outputs = emb_model(**model_inputs, **forward_kwargs)
                 pooled = self._pool_multimodal_features(
                     outputs.hidden_states,
                     batch["input_ids"],

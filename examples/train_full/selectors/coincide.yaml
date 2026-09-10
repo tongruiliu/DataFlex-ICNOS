@@ -7,7 +7,7 @@ flash_attn: fa2
 stage: sft
 do_train: true
 finetuning_type: full
-deepspeed: examples/deepspeed/ds_z3_config.json  # 7B 全参微调需要 ZeRO-3
+deepspeed: examples/deepspeed/ds_z3_config.json
 
 ### dataset
 dataset: mmfinereason_sft_demo
